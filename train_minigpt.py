@@ -337,27 +337,37 @@ def create_enhanced_tokenizer(texts, vocab_size):
     print("Building enhanced vocabulary...")
     tokenizer = ChatTokenizer(vocab_size=vocab_size)
     
+    # Get the current vocabulary size from the tokenizer
+    current_vocab_size = len(tokenizer.word_to_id) if hasattr(tokenizer, 'word_to_id') else 0
+    
+    # Define conversation tokens starting from current vocab size
     conversation_tokens = {
-        '<Q>': tokenizer.next_id,
-        '<A>': tokenizer.next_id + 1,
-        '<CHAT>': tokenizer.next_id + 2,
-        '<END>': tokenizer.next_id + 3,
-        '<TURN>': tokenizer.next_id + 4,
-        '<HUMAN>': tokenizer.next_id + 5,
-        '<AI>': tokenizer.next_id + 6,
-        '<CONTEXT>': tokenizer.next_id + 7
+        '<Q>': current_vocab_size,
+        '<A>': current_vocab_size + 1,
+        '<CHAT>': current_vocab_size + 2,
+        '<END>': current_vocab_size + 3,
+        '<TURN>': current_vocab_size + 4,
+        '<HUMAN>': current_vocab_size + 5,
+        '<AI>': current_vocab_size + 6,
+        '<CONTEXT>': current_vocab_size + 7
     }
     
+    # Add conversation tokens to tokenizer
     for token, idx in conversation_tokens.items():
-        tokenizer.word_to_id[token] = idx
-        tokenizer.id_to_word[idx] = token
-        tokenizer.next_id = idx + 1
+        if hasattr(tokenizer, 'word_to_id') and hasattr(tokenizer, 'id_to_word'):
+            tokenizer.word_to_id[token] = idx
+            tokenizer.id_to_word[idx] = token
+        elif hasattr(tokenizer, 'add_token'):
+            tokenizer.add_token(token)
     
+    # Train tokenizer on sample data
     sample_size = min(100000, len(texts))
     sample_texts = texts[:sample_size]
     tokenizer.fit_on_texts(sample_texts)
     
-    print(f"Enhanced vocabulary size: {len(tokenizer.word_to_id)}")
+    # Get final vocabulary size
+    final_vocab_size = tokenizer.get_vocab_size() if hasattr(tokenizer, 'get_vocab_size') else len(tokenizer.word_to_id)
+    print(f"Enhanced vocabulary size: {final_vocab_size}")
     return tokenizer
 
 def create_large_scale_training_data(texts, tokenizer, seq_len):
@@ -368,6 +378,13 @@ def create_large_scale_training_data(texts, tokenizer, seq_len):
     inputs, targets = [], []
     
     total_batches = (len(texts) + batch_size - 1) // batch_size
+    
+    # Get padding token ID
+    pad_token_id = 0
+    if hasattr(tokenizer, 'special_tokens') and '<PAD>' in tokenizer.special_tokens:
+        pad_token_id = tokenizer.special_tokens['<PAD>']
+    elif hasattr(tokenizer, 'word_to_id') and '<PAD>' in tokenizer.word_to_id:
+        pad_token_id = tokenizer.word_to_id['<PAD>']
     
     for batch_idx in range(total_batches):
         start_idx = batch_idx * batch_size
@@ -382,7 +399,7 @@ def create_large_scale_training_data(texts, tokenizer, seq_len):
                 sequence = tokenizer.texts_to_sequences([combined_text])[0]
                 
                 if len(sequence) <= seq_len:
-                    padded = sequence + [tokenizer.special_tokens['<PAD>']] * (seq_len + 1 - len(sequence))
+                    padded = sequence + [pad_token_id] * (seq_len + 1 - len(sequence))
                     inputs.append(padded[:-1])
                     targets.append(padded[1:])
                 elif len(sequence) > seq_len:
@@ -410,7 +427,7 @@ def train_large_scale_conversation_model():
     print(f"Memory usage: ~{X_train.nbytes / 1024**3:.2f} GB")
     
     config_to_save = CONFIG.copy()
-    config_to_save['tokenizer_vocab_size'] = tokenizer.get_vocab_size()
+    config_to_save['tokenizer_vocab_size'] = tokenizer.get_vocab_size() if hasattr(tokenizer, 'get_vocab_size') else len(tokenizer.word_to_id)
     config_to_save['timestamp'] = datetime.now().isoformat()
     config_to_save['total_sequences'] = len(X_train)
     
@@ -441,8 +458,11 @@ def train_large_scale_conversation_model():
                     .cache())  
     
     print("Building enhanced model...")
+    # Get the actual vocabulary size from the tokenizer
+    actual_vocab_size = tokenizer.get_vocab_size() if hasattr(tokenizer, 'get_vocab_size') else len(tokenizer.word_to_id)
+    
     model = MiniGPT(
-        vocab_size=tokenizer.get_vocab_size(),
+        vocab_size=actual_vocab_size,
         max_seq_len=CONFIG['seq_len'],  
         embed_dim=512,
         num_heads=4,
@@ -451,7 +471,7 @@ def train_large_scale_conversation_model():
         num_experts=4
     )
 
-    dummy_input = tf.random.uniform((1, CONFIG['seq_len']), dtype=tf.int32, minval=0, maxval=tokenizer.get_vocab_size())
+    dummy_input = tf.random.uniform((1, CONFIG['seq_len']), dtype=tf.int32, minval=0, maxval=actual_vocab_size)
     _ = model(dummy_input)  
 
     model.summary()
