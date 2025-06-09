@@ -18,9 +18,9 @@ tf.config.threading.set_intra_op_parallelism_threads(12)
 tf.config.optimizer.set_jit(True)
 
 CONFIG = {
-    'vocab_size': 10000,
-    'seq_len': 128,
-    'batch_size': 16,
+    'vocab_size': 20000,
+    'seq_len': 256,
+    'batch_size': 32,
     'num_epochs': 10,
     'learning_rate': 0.0001,
     'dropout_rate': 0.1,
@@ -410,7 +410,7 @@ def train_large_scale_conversation_model():
     print(f"Memory usage: ~{X_train.nbytes / 1024**3:.2f} GB")
     
     config_to_save = CONFIG.copy()
-    config_to_save['tokenizer_vocab_size'] = len(tokenizer.word_to_id)
+    config_to_save['tokenizer_vocab_size'] = tokenizer.get_vocab_size()
     config_to_save['timestamp'] = datetime.now().isoformat()
     config_to_save['total_sequences'] = len(X_train)
     
@@ -442,7 +442,7 @@ def train_large_scale_conversation_model():
     
     print("Building enhanced model...")
     model = MiniGPT(
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=tokenizer.get_vocab_size(),
         max_seq_len=CONFIG['seq_len'],  
         embed_dim=512,
         num_heads=4,
@@ -451,7 +451,7 @@ def train_large_scale_conversation_model():
         num_experts=4
     )
 
-    dummy_input = tf.random.uniform((1, CONFIG['seq_len']), dtype=tf.int32, minval=0, maxval=tokenizer.vocab_size)
+    dummy_input = tf.random.uniform((1, CONFIG['seq_len']), dtype=tf.int32, minval=0, maxval=tokenizer.get_vocab_size())
     _ = model(dummy_input)  
 
     model.summary()
