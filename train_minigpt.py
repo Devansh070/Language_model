@@ -140,7 +140,8 @@ class SimpleTransformer(tf.keras.Model):
 def download_persona_chat():
     """Download PersonaChat dataset with better error handling"""
     try:
-        dataset = datasets.load_dataset("conv_ai_2", split="train")
+        # Force download from HuggingFace instead of using cache
+        dataset = datasets.load_dataset("conv_ai_2", split="train", cache_dir=None)
         texts = []
         for example in dataset:
             if 'dialog' in example:
@@ -162,7 +163,8 @@ def download_persona_chat():
 def download_daily_dialog():
     """Download DailyDialog dataset with better error handling"""
     try:
-        dataset = datasets.load_dataset("daily_dialog", split="train")
+        # Force download from HuggingFace instead of using cache
+        dataset = datasets.load_dataset("daily_dialog", split="train", cache_dir=None)
         texts = []
         for example in dataset:
             if 'dialog' in example:
@@ -360,7 +362,7 @@ def train_conversation_model():
                 verbose=1
             ),
             tf.keras.callbacks.ModelCheckpoint(
-                'chatbot_model_weights.h5',
+                filepath='chatbot_model.weights.h5',  # Fixed filepath with correct extension
                 monitor='loss',
                 save_best_only=True,
                 save_weights_only=True,
@@ -379,7 +381,7 @@ def train_conversation_model():
         
         # Save model and tokenizer
         logger.info("Saving model and tokenizer...")
-        model.save_weights('chatbot_final_weights.h5')
+        model.save_weights('chatbot_final.weights.h5')  # Fixed filepath with correct extension
         
         with open('chatbot_tokenizer.pkl', 'wb') as f:
             pickle.dump(tokenizer, f)
