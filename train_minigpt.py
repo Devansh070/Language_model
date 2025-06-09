@@ -295,6 +295,24 @@ def masked_accuracy(y_true, y_pred):
     correct = tf.cast(tf.equal(y_true, predictions), tf.float32) * mask
     return tf.reduce_sum(correct) / tf.reduce_sum(mask)
 
+def masked_perplexity(y_true, y_pred):
+    """Calculate perplexity for masked sequences"""
+    # Create mask for non-padding tokens
+    mask = tf.cast(tf.not_equal(y_true, 0), tf.float32)
+    
+    # Calculate cross entropy loss
+    loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred, from_logits=True)
+    
+    # Apply mask
+    masked_loss = loss * mask
+    
+    # Calculate average loss over non-padded tokens
+    avg_loss = tf.reduce_sum(masked_loss) / tf.reduce_sum(mask)
+    
+    # Calculate perplexity
+    perplexity = tf.exp(avg_loss)
+    return perplexity
+
 def train_conversation_model():
     """Main training function with proper error handling"""
     logger.info("=== CONVERSATION CHATBOT TRAINING ===")
@@ -343,7 +361,7 @@ def train_conversation_model():
         model.compile(
             optimizer=optimizer,
             loss=masked_sparse_categorical_crossentropy,
-            metrics=[masked_accuracy]
+            metrics=[masked_accuracy, masked_perplexity]  # Added perplexity metric
         )
         
         # Callbacks
