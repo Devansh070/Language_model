@@ -499,10 +499,10 @@ def train_large_scale_conversation_model():
     model = MiniGPT(
         vocab_size=tokenizer.vocab_size,
         max_seq_len=256,  
-        embed_dim=256,  
+        embed_dim=512,  
         num_heads=4,  
-        num_layers=8,  
-        ffn_dim=768,  
+        num_layers=12,  
+        ffn_dim=1024,  
         num_experts=4  
     )
 
@@ -538,11 +538,22 @@ def train_large_scale_conversation_model():
         return loss
     
     def enhanced_masked_accuracy(y_true, y_pred):
-        """Enhanced masked accuracy metric"""
-        mask = tf.cast(tf.not_equal(y_true, tokenizer.special_tokens['<PAD>']), tf.float32)
-        predictions = tf.cast(tf.argmax(y_pred, axis=-1), tf.int32)
+        """Enhanced accuracy metric that handles padding and type mismatches."""
+        # Get the most likely token for each position
+        predictions = tf.argmax(y_pred, axis=-1)
+        
+        # Convert predictions to int32 to match y_true
+        predictions = tf.cast(predictions, tf.int32)
+        
+        # Create mask for non-padding tokens (where y_true != 0)
+        mask = tf.cast(tf.not_equal(y_true, 0), tf.float32)
+        
+        # Calculate accuracy only on non-padding tokens
         correct = tf.cast(tf.equal(y_true, predictions), tf.float32) * mask
-        return tf.reduce_sum(correct) / (tf.reduce_sum(mask) + 1e-8)
+        total = tf.reduce_sum(mask)
+        
+        # Avoid division by zero
+        return tf.reduce_sum(correct) / (total + tf.keras.backend.epsilon())
     
     # Compile model
     model.compile(
