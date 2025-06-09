@@ -362,7 +362,7 @@ def train_conversation_model():
                 verbose=1
             ),
             tf.keras.callbacks.ModelCheckpoint(
-                filepath='chatbot_model.weights.h5',  # Fixed filepath with correct extension
+                'chatbot_model.weights.h5',  # Fixed filepath with correct extension
                 monitor='loss',
                 save_best_only=True,
                 save_weights_only=True,
