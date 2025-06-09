@@ -3,7 +3,7 @@ import tensorflow_datasets as tfds
 import numpy as np
 import pickle
 import os
-from minigpt_transformer import MiniGPT, build_chat_model, ChatTokenizer
+from minigpt_transformer import MiniGPT, ChatTokenizer
 import math
 import json
 from datetime import datetime
