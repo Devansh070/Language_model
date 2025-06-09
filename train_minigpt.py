@@ -144,11 +144,15 @@ def download_persona_chat():
         cache_dir = os.path.join(os.getcwd(), "dataset_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Try different dataset names
+        # Try different dataset names with offline mode
         try:
-            dataset = datasets.load_dataset("conv_ai_2", split="train", cache_dir=cache_dir)
+            dataset = datasets.load_dataset("conv_ai_2", split="train", cache_dir=cache_dir, local_files_only=True)
         except:
-            dataset = datasets.load_dataset("conv_ai", "conv_ai_2", split="train", cache_dir=cache_dir)
+            try:
+                dataset = datasets.load_dataset("conv_ai", "conv_ai_2", split="train", cache_dir=cache_dir, local_files_only=True)
+            except:
+                # If offline loading fails, try online loading
+                dataset = datasets.load_dataset("conv_ai_2", split="train", cache_dir=cache_dir)
             
         texts = []
         for example in dataset:
@@ -174,7 +178,12 @@ def download_daily_dialog():
         cache_dir = os.path.join(os.getcwd(), "dataset_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        dataset = datasets.load_dataset("daily_dialog", split="train", cache_dir=cache_dir)
+        try:
+            dataset = datasets.load_dataset("daily_dialog", split="train", cache_dir=cache_dir, local_files_only=True)
+        except:
+            # If offline loading fails, try online loading
+            dataset = datasets.load_dataset("daily_dialog", split="train", cache_dir=cache_dir)
+        
         texts = []
         for example in dataset:
             if 'dialog' in example:
@@ -197,11 +206,15 @@ def download_reddit_conversations():
         cache_dir = os.path.join(os.getcwd(), "dataset_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Try different Reddit conversation datasets
+        # Try different Reddit conversation datasets with offline mode
         try:
-            dataset = datasets.load_dataset("reddit", "conversations", split="train", cache_dir=cache_dir)
+            dataset = datasets.load_dataset("reddit", "conversations", split="train", cache_dir=cache_dir, local_files_only=True)
         except:
-            dataset = datasets.load_dataset("reddit_tifu", "short", split="train", cache_dir=cache_dir)
+            try:
+                dataset = datasets.load_dataset("reddit_tifu", "short", split="train", cache_dir=cache_dir, local_files_only=True)
+            except:
+                # If offline loading fails, try online loading
+                dataset = datasets.load_dataset("reddit", "conversations", split="train", cache_dir=cache_dir)
             
         texts = []
         for example in dataset:
@@ -545,7 +558,12 @@ def download_alpaca():
         cache_dir = os.path.join(os.getcwd(), "dataset_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        dataset = datasets.load_dataset("tatsu-lab/alpaca", split="train", cache_dir=cache_dir)
+        try:
+            dataset = datasets.load_dataset("tatsu-lab/alpaca", split="train", cache_dir=cache_dir, local_files_only=True)
+        except:
+            # If offline loading fails, try online loading
+            dataset = datasets.load_dataset("tatsu-lab/alpaca", split="train", cache_dir=cache_dir)
+        
         texts = []
         for example in dataset:
             if 'instruction' in example and 'output' in example:
@@ -566,7 +584,12 @@ def download_dolly():
         cache_dir = os.path.join(os.getcwd(), "dataset_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        dataset = datasets.load_dataset("databricks/databricks-dolly-15k", split="train", cache_dir=cache_dir)
+        try:
+            dataset = datasets.load_dataset("databricks/databricks-dolly-15k", split="train", cache_dir=cache_dir, local_files_only=True)
+        except:
+            # If offline loading fails, try online loading
+            dataset = datasets.load_dataset("databricks/databricks-dolly-15k", split="train", cache_dir=cache_dir)
+        
         texts = []
         for example in dataset:
             if 'instruction' in example and 'response' in example:
@@ -587,7 +610,12 @@ def download_anthropic_hh():
         cache_dir = os.path.join(os.getcwd(), "dataset_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        dataset = datasets.load_dataset("Anthropic/hh-rlhf", split="train", cache_dir=cache_dir)
+        try:
+            dataset = datasets.load_dataset("Anthropic/hh-rlhf", split="train", cache_dir=cache_dir, local_files_only=True)
+        except:
+            # If offline loading fails, try online loading
+            dataset = datasets.load_dataset("Anthropic/hh-rlhf", split="train", cache_dir=cache_dir)
+        
         texts = []
         for example in dataset:
             if 'chosen' in example:
@@ -611,7 +639,12 @@ def download_sharegpt():
         cache_dir = os.path.join(os.getcwd(), "dataset_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        dataset = datasets.load_dataset("AlekseyKorshuk/sharegpt", split="train", cache_dir=cache_dir)
+        try:
+            dataset = datasets.load_dataset("AlekseyKorshuk/sharegpt", split="train", cache_dir=cache_dir, local_files_only=True)
+        except:
+            # If offline loading fails, try online loading
+            dataset = datasets.load_dataset("AlekseyKorshuk/sharegpt", split="train", cache_dir=cache_dir)
+        
         texts = []
         for example in dataset:
             if 'conversations' in example:
@@ -632,7 +665,12 @@ def download_lima():
         cache_dir = os.path.join(os.getcwd(), "dataset_cache")
         os.makedirs(cache_dir, exist_ok=True)
         
-        dataset = datasets.load_dataset("GAIR/lima", split="train", cache_dir=cache_dir)
+        try:
+            dataset = datasets.load_dataset("GAIR/lima", split="train", cache_dir=cache_dir, local_files_only=True)
+        except:
+            # If offline loading fails, try online loading
+            dataset = datasets.load_dataset("GAIR/lima", split="train", cache_dir=cache_dir)
+        
         texts = []
         for example in dataset:
             if 'conversations' in example:
@@ -928,15 +966,15 @@ if __name__ == "__main__":
     try:
         model, tokenizer, history = train_conversation_model()
         
-        # Test the model
-        print("\n=== Testing the model ===")
-        test_inputs = ["Hello", "How are you?", "What's your name?", "Can you help me?"]
-        
-        for test_input in test_inputs:
-            response = generate_response(model, tokenizer, test_input)
-            print(f"Input: {test_input}")
-            print(f"Response: {response}")
-            print("-" * 50)
+        print("\n=== Chatbot is ready! Type 'quit' to exit ===")
+        while True:
+            user_input = input("\nYou: ").strip()
+            if user_input.lower() == 'quit':
+                print("Goodbye!")
+                break
+                
+            response = generate_response(model, tokenizer, user_input)
+            print(f"Bot: {response}")
             
     except Exception as e:
         logger.error(f"Main execution failed: {e}")
