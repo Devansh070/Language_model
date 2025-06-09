@@ -18,17 +18,15 @@ tf.config.threading.set_intra_op_parallelism_threads(12)
 tf.config.optimizer.set_jit(True)
 
 CONFIG = {
-    'vocab_size': 15000,  
-    'seq_len': 256,       
-    'batch_size': 32,     
-    'num_epochs': 10,     
-    'learning_rate': 0.0002,
+    'vocab_size': 10000,
+    'seq_len': 128,
+    'batch_size': 16,
+    'num_epochs': 10,
+    'learning_rate': 0.0001,
     'dropout_rate': 0.1,
-    'temperature': 1.0,
-    'max_response_length': 80,
-    'target_tokens': 500_000,  
-    'warmup_steps': 1000,
-    'gradient_accumulation_steps': 4
+    'temperature': 1.2,
+    'max_response_length': 60,
+    'target_tokens': 500000
 }
 
 def download_persona_chat():
