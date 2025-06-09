@@ -253,7 +253,7 @@ class MiniGPT(tf.keras.Model):
 
 class ChatTokenizer:
     def __init__(self, vocab_size=10000):
-        self.vocab_size = vocab_size
+        self._max_vocab_size = vocab_size
         self.word_to_id = {}
         self.id_to_word = {}
         self.special_tokens = {
@@ -280,7 +280,7 @@ class ChatTokenizer:
                 word_counts[word] = word_counts.get(word, 0) + 1
         sorted_words = sorted(word_counts.items(), key=lambda x: (-x[1], x[0]))
         for word, _ in sorted_words:
-            if len(self.word_to_id) >= self.vocab_size:
+            if len(self.word_to_id) >= self._max_vocab_size:
                 break
             if word not in self.word_to_id:
                 idx = len(self.word_to_id)
