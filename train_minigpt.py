@@ -29,7 +29,7 @@ CONFIG = {
     'dropout_rate': 0.1,
     'temperature': 1.2,
     'max_response_length': 60,
-    'target_tokens': 500000
+    'target_tokens': 10000000  # Updated to 10M tokens
 }
 
 class SimpleTokenizer:
@@ -140,8 +140,16 @@ class SimpleTransformer(tf.keras.Model):
 def download_persona_chat():
     """Download PersonaChat dataset with better error handling"""
     try:
-        # Force download from HuggingFace instead of using cache
-        dataset = datasets.load_dataset("conv_ai_2", split="train", cache_dir=None)
+        # Create a specific cache directory
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Try different dataset names
+        try:
+            dataset = datasets.load_dataset("conv_ai_2", split="train", cache_dir=cache_dir)
+        except:
+            dataset = datasets.load_dataset("conv_ai", "conv_ai_2", split="train", cache_dir=cache_dir)
+            
         texts = []
         for example in dataset:
             if 'dialog' in example:
@@ -163,8 +171,10 @@ def download_persona_chat():
 def download_daily_dialog():
     """Download DailyDialog dataset with better error handling"""
     try:
-        # Force download from HuggingFace instead of using cache
-        dataset = datasets.load_dataset("daily_dialog", split="train", cache_dir=None)
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("daily_dialog", split="train", cache_dir=cache_dir)
         texts = []
         for example in dataset:
             if 'dialog' in example:
@@ -179,6 +189,329 @@ def download_daily_dialog():
         return texts
     except Exception as e:
         logger.error(f"Failed to load DailyDialog: {e}")
+        return []
+
+def download_reddit_conversations():
+    """Download Reddit conversations dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Try different Reddit conversation datasets
+        try:
+            dataset = datasets.load_dataset("reddit", "conversations", split="train", cache_dir=cache_dir)
+        except:
+            dataset = datasets.load_dataset("reddit_tifu", "short", split="train", cache_dir=cache_dir)
+            
+        texts = []
+        for example in dataset:
+            if 'conversation' in example:
+                conv = example['conversation']
+                for i in range(len(conv) - 1):
+                    if conv[i].strip() and conv[i+1].strip():
+                        texts.append(f"Q: {conv[i].strip()}")
+                        texts.append(f"A: {conv[i+1].strip()}")
+            elif 'tldr' in example and 'text' in example:
+                texts.append(f"Q: {example['text'].strip()}")
+                texts.append(f"A: {example['tldr'].strip()}")
+        logger.info(f"Reddit conversations: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load Reddit conversations: {e}")
+        return []
+
+def download_empathetic_dialogues():
+    """Download EmpatheticDialogues dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("empathetic_dialogues", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'utterance' in example and 'context' in example:
+                context = example['context'].strip()
+                utterance = example['utterance'].strip()
+                if context and utterance:
+                    texts.append(f"Q: {context}")
+                    texts.append(f"A: {utterance}")
+        logger.info(f"EmpatheticDialogues: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load EmpatheticDialogues: {e}")
+        return []
+
+def download_blended_skill_talk():
+    """Download BlendedSkillTalk dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("blended_skill_talk", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"BlendedSkillTalk: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load BlendedSkillTalk: {e}")
+        return []
+
+def download_wizard_of_wikipedia():
+    """Download Wizard of Wikipedia dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("wizard_of_wikipedia", "generated", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"Wizard of Wikipedia: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load Wizard of Wikipedia: {e}")
+        return []
+
+def download_conv_ai_3():
+    """Download ConvAI3 dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_3", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI3: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI3: {e}")
+        return []
+
+def download_conv_ai_2():
+    """Download ConvAI2 dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2: {e}")
+        return []
+
+def download_conv_ai():
+    """Download ConvAI dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI: {e}")
+        return []
+
+def download_conv_ai_2_personachat():
+    """Download ConvAI2 PersonaChat dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", "personachat", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2 PersonaChat: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2 PersonaChat: {e}")
+        return []
+
+def download_conv_ai_2_convai2():
+    """Download ConvAI2 dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", "convai2", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2: {e}")
+        return []
+
+def download_conv_ai_2_convai2_inferred():
+    """Download ConvAI2 Inferred dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", "convai2_inferred", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2 Inferred: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2 Inferred: {e}")
+        return []
+
+def download_conv_ai_2_convai2_inferred_original():
+    """Download ConvAI2 Inferred Original dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", "convai2_inferred_original", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2 Inferred Original: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2 Inferred Original: {e}")
+        return []
+
+def download_conv_ai_2_convai2_inferred_original_personachat():
+    """Download ConvAI2 Inferred Original PersonaChat dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", "convai2_inferred_original_personachat", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2 Inferred Original PersonaChat: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2 Inferred Original PersonaChat: {e}")
+        return []
+
+def download_conv_ai_2_convai2_inferred_original_convai2():
+    """Download ConvAI2 Inferred Original ConvAI2 dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", "convai2_inferred_original_convai2", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2 Inferred Original ConvAI2: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2 Inferred Original ConvAI2: {e}")
+        return []
+
+def download_conv_ai_2_convai2_inferred_original_convai2_inferred():
+    """Download ConvAI2 Inferred Original ConvAI2 Inferred dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", "convai2_inferred_original_convai2_inferred", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2 Inferred Original ConvAI2 Inferred: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2 Inferred Original ConvAI2 Inferred: {e}")
+        return []
+
+def download_conv_ai_2_convai2_inferred_original_convai2_inferred_original():
+    """Download ConvAI2 Inferred Original ConvAI2 Inferred Original dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("conv_ai_2", "convai2_inferred_original_convai2_inferred_original", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'dialog' in example:
+                dialog = example['dialog']
+                for i in range(len(dialog) - 1):
+                    if dialog[i].strip() and dialog[i+1].strip():
+                        texts.append(f"Q: {dialog[i].strip()}")
+                        texts.append(f"A: {dialog[i+1].strip()}")
+        logger.info(f"ConvAI2 Inferred Original ConvAI2 Inferred Original: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ConvAI2 Inferred Original ConvAI2 Inferred Original: {e}")
         return []
 
 def create_fallback_conversation_data():
@@ -206,6 +539,114 @@ def create_fallback_conversation_data():
     logger.info(f"Fallback conversation data: {len(texts)} texts created")
     return texts
 
+def download_alpaca():
+    """Download Alpaca dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("tatsu-lab/alpaca", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'instruction' in example and 'output' in example:
+                instruction = example['instruction'].strip()
+                output = example['output'].strip()
+                if instruction and output:
+                    texts.append(f"Q: {instruction}")
+                    texts.append(f"A: {output}")
+        logger.info(f"Alpaca: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load Alpaca: {e}")
+        return []
+
+def download_dolly():
+    """Download Dolly dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("databricks/databricks-dolly-15k", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'instruction' in example and 'response' in example:
+                instruction = example['instruction'].strip()
+                response = example['response'].strip()
+                if instruction and response:
+                    texts.append(f"Q: {instruction}")
+                    texts.append(f"A: {response}")
+        logger.info(f"Dolly: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load Dolly: {e}")
+        return []
+
+def download_anthropic_hh():
+    """Download Anthropic HH dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("Anthropic/hh-rlhf", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'chosen' in example:
+                chosen = example['chosen'].strip()
+                if chosen:
+                    # Split the chosen text into turns
+                    turns = chosen.split('\n\n')
+                    for i in range(len(turns)-1):
+                        if turns[i].strip() and turns[i+1].strip():
+                            texts.append(f"Q: {turns[i].strip()}")
+                            texts.append(f"A: {turns[i+1].strip()}")
+        logger.info(f"Anthropic HH: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load Anthropic HH: {e}")
+        return []
+
+def download_sharegpt():
+    """Download ShareGPT dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("AlekseyKorshuk/sharegpt", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'conversations' in example:
+                conv = example['conversations']
+                for i in range(len(conv)-1):
+                    if conv[i].strip() and conv[i+1].strip():
+                        texts.append(f"Q: {conv[i].strip()}")
+                        texts.append(f"A: {conv[i+1].strip()}")
+        logger.info(f"ShareGPT: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load ShareGPT: {e}")
+        return []
+
+def download_lima():
+    """Download LIMA dataset"""
+    try:
+        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        dataset = datasets.load_dataset("GAIR/lima", split="train", cache_dir=cache_dir)
+        texts = []
+        for example in dataset:
+            if 'conversations' in example:
+                conv = example['conversations']
+                for i in range(len(conv)-1):
+                    if conv[i].strip() and conv[i+1].strip():
+                        texts.append(f"Q: {conv[i].strip()}")
+                        texts.append(f"A: {conv[i+1].strip()}")
+        logger.info(f"LIMA: {len(texts)} texts loaded")
+        return texts
+    except Exception as e:
+        logger.error(f"Failed to load LIMA: {e}")
+        return []
+
 def prepare_conversation_data():
     """Load and prepare conversation datasets with fallback"""
     logger.info("Loading conversation datasets...")
@@ -215,18 +656,47 @@ def prepare_conversation_data():
     dataset_loaders = [
         ('PersonaChat', download_persona_chat),
         ('DailyDialog', download_daily_dialog),
+        ('Reddit', download_reddit_conversations),
+        ('EmpatheticDialogues', download_empathetic_dialogues),
+        ('BlendedSkillTalk', download_blended_skill_talk),
+        ('WizardOfWikipedia', download_wizard_of_wikipedia),
+        ('ConvAI3', download_conv_ai_3),
+        ('ConvAI2', download_conv_ai_2),
+        ('ConvAI', download_conv_ai),
+        ('ConvAI2 PersonaChat', download_conv_ai_2_personachat),
+        ('ConvAI2 ConvAI2', download_conv_ai_2_convai2),
+        ('ConvAI2 Inferred', download_conv_ai_2_convai2_inferred),
+        ('ConvAI2 Inferred Original', download_conv_ai_2_convai2_inferred_original),
+        ('ConvAI2 Inferred Original PersonaChat', download_conv_ai_2_convai2_inferred_original_personachat),
+        ('ConvAI2 Inferred Original ConvAI2', download_conv_ai_2_convai2_inferred_original_convai2),
+        ('ConvAI2 Inferred Original ConvAI2 Inferred', download_conv_ai_2_convai2_inferred_original_convai2_inferred),
+        ('ConvAI2 Inferred Original ConvAI2 Inferred Original', download_conv_ai_2_convai2_inferred_original_convai2_inferred_original),
+        ('Alpaca', download_alpaca),
+        ('Dolly', download_dolly),
+        ('Anthropic HH', download_anthropic_hh),
+        ('ShareGPT', download_sharegpt),
+        ('LIMA', download_lima),
     ]
     
     for name, loader_func in dataset_loaders:
         try:
             logger.info(f"Loading {name}...")
             texts = loader_func()
-            all_texts.extend(texts)
+            if texts:  # Only extend if we got some texts
+                all_texts.extend(texts)
+                total_tokens = sum(len(text.split()) for text in all_texts)
+                logger.info(f"Total texts so far: {len(all_texts):,}")
+                logger.info(f"Total tokens so far: {total_tokens:,}")
+                
+                # Check if we've reached our target
+                if total_tokens >= CONFIG['target_tokens']:
+                    logger.info(f"Reached target of {CONFIG['target_tokens']:,} tokens")
+                    break
         except Exception as e:
             logger.error(f"Failed to load {name}: {e}")
             continue
     
-    # If no datasets loaded successfully, use fallback
+    # If we haven't reached our target, use fallback data
     if len(all_texts) == 0:
         logger.warning("No external datasets loaded, using fallback conversation data")
         all_texts = create_fallback_conversation_data()
@@ -235,8 +705,12 @@ def prepare_conversation_data():
     fallback_texts = create_fallback_conversation_data()
     all_texts.extend(fallback_texts)
     
+    # Calculate total tokens
+    total_tokens = sum(len(text.split()) for text in all_texts)
+    
     logger.info(f"Total training texts: {len(all_texts):,}")
     logger.info(f"Estimated Q&A pairs: {len(all_texts) // 2:,}")
+    logger.info(f"Total tokens (without padding): {total_tokens:,}")
     
     return all_texts
 
@@ -246,6 +720,7 @@ def create_training_data(texts, tokenizer, seq_len):
     
     inputs, targets = [], []
     pad_token_id = 0  # <PAD> token
+    total_tokens = 0
     
     for i in range(0, len(texts)-1, 2):
         if i+1 < len(texts) and texts[i].startswith('Q:') and texts[i+1].startswith('A:'):
@@ -256,6 +731,7 @@ def create_training_data(texts, tokenizer, seq_len):
                 sequence = tokenizer.texts_to_sequences([combined_text])[0]
                 
                 if len(sequence) > 1:  # Ensure we have at least 2 tokens
+                    total_tokens += len(sequence)
                     # Pad or truncate to seq_len + 1
                     if len(sequence) <= seq_len:
                         padded = sequence + [pad_token_id] * (seq_len + 1 - len(sequence))
@@ -271,6 +747,7 @@ def create_training_data(texts, tokenizer, seq_len):
                 continue
     
     logger.info(f"Created {len(inputs):,} training sequences")
+    logger.info(f"Total non-padding tokens: {total_tokens:,}")
     return np.array(inputs, dtype=np.int32), np.array(targets, dtype=np.int32)
 
 def masked_sparse_categorical_crossentropy(y_true, y_pred):
