@@ -13,8 +13,8 @@ class RotaryEmbedding(layers.Layer):
         if self.dim is None:
             self.dim = int(input_shape[-1])
         assert self.dim % 2 == 0, "RotaryEmbedding: dim must be even"
-        inv_freq = 1.0 / (10000 ** (np.arange(0, self.dim // 2) / (self.dim // 2)))
-        t = np.arange(self.max_seq_len)
+        inv_freq = 1.0 / (10000 ** (np.arange(0, self.dim // 2, dtype=np.float32) / (self.dim // 2)))
+        t = np.arange(self.max_seq_len, dtype=np.float32)
         freqs = np.einsum('i,j->ij', t, inv_freq)
         emb = np.concatenate([np.sin(freqs), np.cos(freqs)], axis=-1)
         self.rotary_emb = self.add_weight(
@@ -46,6 +46,7 @@ class SparseSelfAttention(layers.Layer):
         self.num_heads = num_heads
         self.block_size = block_size
         self.head_dim = embed_dim // num_heads
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.q_proj = layers.Dense(embed_dim, use_bias=False)
         self.k_proj = layers.Dense(embed_dim, use_bias=False)
         self.v_proj = layers.Dense(embed_dim, use_bias=False)
@@ -101,7 +102,7 @@ class SparseSelfAttention(layers.Layer):
         attn_output = tf.reshape(attn_output, [batch_size, seq_len, self.embed_dim])
         
         out = self.out_proj(attn_output)
-        return out + x
+        return out
 
 class MoE(layers.Layer):
     def __init__(self, d_model, d_ff, num_experts=4, k=2, dropout=0.1, **kwargs):
@@ -149,7 +150,7 @@ class MoE(layers.Layer):
         moe_out = tf.reduce_sum(topk_expert_outputs * gate_scores_exp, axis=1)
         
         moe_out = tf.reshape(moe_out, [batch_size, seq_len, self.d_model])
-        return moe_out + x
+        return moe_out
 
 def FeedForward(dim, hidden_dim, dropout=0.1):
     return keras.Sequential([
@@ -230,22 +231,28 @@ class MiniGPT(tf.keras.Model):
             next_token_logits = logits[:, -1, :] / temperature
             
             if top_k > 0:
-                indices_to_remove = next_token_logits < tf.math.top_k(next_token_logits, top_k)[0][..., -1, None]
+                top_k_values, _ = tf.math.top_k(next_token_logits, k=top_k)
+                min_top_k = top_k_values[:, -1:] 
+                indices_to_remove = next_token_logits < min_top_k
                 next_token_logits = tf.where(indices_to_remove, tf.ones_like(next_token_logits) * -1e9, next_token_logits)
             
             if top_p < 1.0:
-                sorted_logits = tf.sort(next_token_logits, direction='DESCENDING')
-                sorted_indices = tf.argsort(next_token_logits, direction='DESCENDING')
+                sorted_logits, sorted_indices = tf.nn.top_k(next_token_logits, k=tf.shape(next_token_logits)[-1])
                 cumulative_probs = tf.cumsum(tf.nn.softmax(sorted_logits, axis=-1), axis=-1)
                 sorted_indices_to_remove = cumulative_probs > top_p
                 sorted_indices_to_remove = tf.concat([tf.zeros_like(sorted_indices_to_remove[:, :1]), sorted_indices_to_remove[:, :-1]], axis=-1)
-                indices_to_remove = tf.gather(sorted_indices_to_remove, tf.argsort(sorted_indices), axis=-1)
+                indices_to_remove = tf.scatter_nd(
+                    tf.expand_dims(sorted_indices, -1),
+                    sorted_indices_to_remove,
+                    tf.shape(next_token_logits)
+                )
                 next_token_logits = tf.where(indices_to_remove, tf.ones_like(next_token_logits) * -1e9, next_token_logits)
             
             probs = tf.nn.softmax(next_token_logits, axis=-1)
-            next_token = tf.random.categorical(probs, num_samples=1)
+            next_token = tf.random.categorical(tf.math.log(probs + 1e-8), num_samples=1)
             generated = tf.concat([generated, next_token], axis=1)
             
+            # Check for end token
             if next_token[0][0] == 0:
                 break
         
