@@ -7,7 +7,7 @@ import json
 import logging
 import datasets
 from datasets import disable_caching
-from minigpt_transformer import MiniGPT, ChatTokenizer
+from minigpt_transformer import EnhancedMiniGPT, SentencePieceTokenizer
 
 # Disable datasets caching to prevent disk space issues
 disable_caching()
@@ -349,7 +349,7 @@ def train_model():
         
         # Initialize tokenizer
         logger.info("Creating and fitting tokenizer...")
-        tokenizer = ChatTokenizer()
+        tokenizer = SentencePieceTokenizer()
         
         # Fit tokenizer in batches to manage memory
         batch_size = 10000
@@ -391,7 +391,7 @@ def train_model():
         
         # Build large model
         logger.info("Building large MiniGPT model...")
-        model = MiniGPT(vocab_size=vocab_size)
+        model = EnhancedMiniGPT(vocab_size=vocab_size)
         
         # Compile with optimization for large model
         logger.info("Compiling model...")
