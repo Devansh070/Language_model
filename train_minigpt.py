@@ -170,34 +170,13 @@ def load_all_conversation_datasets():
     
     # Define datasets to try loading
     datasets_config = [
-        # Conversation datasets
-        ("daily_dialog", None),
-        ("empathetic_dialogues", None),
-        ("blended_skill_talk", None),
-        ("conv_ai_2", None),
-        ("AlekseyKorshuk/sharegpt", None),
-        
-        # Additional conversation datasets
-        ("microsoft/DialoGPT-medium", None),
-        ("facebook/blended_skill_talk", None),
-        ("PygmalionAI/PIPPA", None),
-        ("Anthropic/hh-rlhf", None),
-        ("Open-Orca/OpenOrca", None),
-        ("WizardLM/WizardLM_evol_instruct_70k", None),
-        ("tatsu-lab/alpaca", None),
-        ("yahma/alpaca-cleaned", None),
-        ("databricks/databricks-dolly-15k", None),
-        ("OpenAssistant/oasst1", None),
-        ("HuggingFaceH4/ultrachat_200k", None),
-        ("HuggingFaceH4/ultrafeedback_binarized", None),
-        
-        # Reddit datasets
-        ("reddit_tifu", "short"),
-        ("reddit_tifu", "long"),
-        
-        # Multi-turn conversation datasets
-        ("Salesforce/dialogstudio", None),
-        ("microsoft/DSTC11-Track4-SIMMC2.1", None),
+        # Core conversation datasets
+        ("daily_dialog", None),           # DailyDialog
+        ("empathetic_dialogues", None),   # Empathetic Dialogues
+        ("conv_ai_2", None),             # ConvAI2
+        ("PygmalionAI/PIPPA", None),     # PIPPA
+        ("OpenAssistant/oasst1", None),  # OpenAssistant Conversations
+        ("HuggingFaceH4/ultrachat_200k", None),  # GPT-4/GPT-3.5 Augmented
     ]
     
     for dataset_name, config_name in datasets_config:
