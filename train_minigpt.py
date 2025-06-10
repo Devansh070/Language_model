@@ -7,7 +7,7 @@ import json
 import logging
 import datasets
 from datasets import disable_caching
-from minigpt_transformer import EnhancedMiniGPT, SentencePieceTokenizer
+from minigpt_transformer import EnhancedMiniGPT, SentencePieceTokenizer, ModelConfig
 
 # Disable datasets caching to prevent disk space issues
 disable_caching()
@@ -291,8 +291,8 @@ def create_training_sequences(texts, tokenizer, seq_len, batch_size=1000):
                     # Combine into training text
                     combined_text = f"{question} {answer}"
                     
-                    # Tokenize
-                    sequence = tokenizer.texts_to_sequences([combined_text])[0]
+                    # Tokenize using SentencePieceTokenizer
+                    sequence = tokenizer.encode(combined_text)
                     
                     if len(sequence) > 1:
                         total_tokens += len(sequence)
@@ -306,7 +306,7 @@ def create_training_sequences(texts, tokenizer, seq_len, batch_size=1000):
                         # Create input-target pairs (shift by 1)
                         inputs.append(padded[:-1])
                         targets.append(padded[1:])
-                        
+                    
                 except Exception as e:
                     logger.warning(f"Error processing sequence: {e}")
                     continue
@@ -351,15 +351,30 @@ def train_model():
         logger.info("Creating and fitting tokenizer...")
         tokenizer = SentencePieceTokenizer()
         
-        # Fit tokenizer in batches to manage memory
+        # Train tokenizer in batches to manage memory
         batch_size = 10000
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i+batch_size]
-            if i == 0:
-                tokenizer.fit_on_texts(batch_texts)
-            else:
-                tokenizer.update_on_texts(batch_texts)
-            logger.info(f"Fitted tokenizer on batch {i//batch_size + 1}")
+        temp_text_file = "temp_training_texts.txt"
+        
+        try:
+            # Write texts to temporary file for training
+            with open(temp_text_file, 'w', encoding='utf-8') as f:
+                for i in range(0, len(texts), batch_size):
+                    batch_texts = texts[i:i+batch_size]
+                    for text in batch_texts:
+                        f.write(text + '\n')
+                    logger.info(f"Wrote batch {i//batch_size + 1} to temp file")
+            
+            # Train tokenizer on the file
+            logger.info("Training tokenizer...")
+            tokenizer.train(texts, model_path='tokenizer')
+            
+            # Load the trained tokenizer
+            tokenizer.load('tokenizer')
+            
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_text_file):
+                os.remove(temp_text_file)
         
         vocab_size = tokenizer.get_vocab_size()
         logger.info(f"Final vocabulary size: {vocab_size:,}")
@@ -391,7 +406,20 @@ def train_model():
         
         # Build large model
         logger.info("Building large MiniGPT model...")
-        model = EnhancedMiniGPT(vocab_size=vocab_size)
+        config = ModelConfig(
+            vocab_size=vocab_size,
+            max_seq_len=TRAINING_CONFIG['max_seq_len'],
+            embed_dim=512,
+            num_heads=8,
+            num_layers=12,
+            ffn_dim=2048,
+            num_experts=4,
+            dropout=0.1,
+            block_size=128,
+            use_flash_attention=True,
+            use_gradient_checkpointing=True
+        )
+        model = EnhancedMiniGPT(config)
         
         # Compile with optimization for large model
         logger.info("Compiling model...")
