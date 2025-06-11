@@ -181,10 +181,10 @@ def train_model():
         config = ModelConfig(
             vocab_size=50257,
             max_seq_len=512,
-            embed_dim=768,
-            num_heads=12,
+            embed_dim=512,
+            num_heads=8,
             num_layers=12,
-            ffn_dim=3072,
+            ffn_dim=2048,
             dropout=0.1,
             use_custom_attention=True
         )
@@ -196,6 +196,7 @@ def train_model():
         # Build model
         model.build_model()
         logger.info(f"Model created with {model.count_params():,} parameters")
+        print(f"Model created with {model.count_params():,} parameters")
         
         # Setup optimizer
         initial_learning_rate = 1e-4
@@ -322,7 +323,16 @@ def load_and_test_model(model_path="./checkpoints/minigpt_final.keras"):
     """Load and test a saved model"""
     try:
         # Create model with same config
-        config = ModelConfig()
+        config = ModelConfig(
+            vocab_size=50257,
+            max_seq_len=512,
+            embed_dim=512,
+            num_heads=8,
+            num_layers=12,
+            ffn_dim=2048,
+            dropout=0.1,
+            use_custom_attention=True
+        )
         model = EnhancedMiniGPT(config)
         model.build_model()
         
