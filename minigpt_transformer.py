@@ -1,667 +1,762 @@
 import tensorflow as tf
+from tensorflow.keras import layers, Model
 import numpy as np
-import sentencepiece as sptokenizer
-import json
-import os
-import time
-from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
+from typing import Optional, List, Tuple
+import os
+import logging
 
-keras = tf.keras
-layers = tf.keras.layers
+# Optional: only import if transformers is available
+try:
+    from transformers import AutoTokenizer
+    HAS_TRANSFORMERS = True
+except ImportError:
+    print("Warning: transformers library not found. Tokenizer features will be disabled.")
+    HAS_TRANSFORMERS = False
 
-# Enable mixed precision training
-tf.keras.mixed_precision.set_global_policy('mixed_float16')
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelConfig:
-    """Configuration class for MiniGPT model."""
-    vocab_size: int = 25000
-    max_seq_len: int = 256
+    """Configuration for the MiniGPT model"""
+    vocab_size: int = 50257  # GPT-2 tokenizer vocab size
+    max_seq_len: int = 512
     embed_dim: int = 512
-    num_heads: int = 4
+    num_heads: int = 8
     num_layers: int = 12
-    ffn_dim: int = 1024
-    num_experts: int = 4
+    ffn_dim: int = 2048
     dropout: float = 0.1
-    block_size: int = 128
-    use_flash_attention: bool = True
-    use_gradient_checkpointing: bool = True
+    layer_norm_epsilon: float = 1e-5
+    use_custom_attention: bool = True  # Enable Custom Multi-Head Attention by default
 
-class FlashAttention(layers.Layer):
-    """Memory-efficient Flash Attention implementation."""
+class RotaryPositionalEmbedding(layers.Layer):
+    """Rotary Positional Embedding (RoPE)"""
     
-    def __init__(self, embed_dim, num_heads, block_size=64, **kwargs):
-        super().__init__(**kwargs)
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-        self.block_size = block_size
-        self.scale = 1.0 / tf.math.sqrt(tf.cast(self.head_dim, tf.float32))
-        
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        
-        self.q_proj = layers.Dense(embed_dim, use_bias=False)
-        self.k_proj = layers.Dense(embed_dim, use_bias=False)
-        self.v_proj = layers.Dense(embed_dim, use_bias=False)
-        self.out_proj = layers.Dense(embed_dim, use_bias=False)
-
-    def _split_heads(self, x, batch_size, seq_len):
-        """Split the last dimension into (num_heads, head_dim)."""
-        x = tf.reshape(x, [batch_size, seq_len, self.num_heads, self.head_dim])
-        return tf.transpose(x, [0, 2, 1, 3])  # [batch, heads, seq, head_dim]
-
-    def _flash_attention_block(self, q_block, k, v, causal_mask=None):
-        """Compute attention for a block of queries."""
-        # Compute attention scores
-        scores = tf.matmul(q_block, k, transpose_b=True) * self.scale
-        
-        # Apply causal mask if provided
-        if causal_mask is not None:
-            scores = tf.where(causal_mask, scores, -1e9)
-        
-        # Compute attention weights and output
-        weights = tf.nn.softmax(scores, axis=-1)
-        output = tf.matmul(weights, v)
-        
-        return output, weights
-
-    def call(self, x, attention_mask=None, training=None):
-        batch_size = tf.shape(x)[0]
-        seq_len = tf.shape(x)[1]
-        
-        # Project to q, k, v
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        
-        # Split heads
-        q = self._split_heads(q, batch_size, seq_len)
-        k = self._split_heads(k, batch_size, seq_len)
-        v = self._split_heads(v, batch_size, seq_len)
-        
-        # Create causal mask
-        causal_mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
-        causal_mask = tf.cast(causal_mask, tf.bool)
-        causal_mask = tf.reshape(causal_mask, (1, 1, seq_len, seq_len))
-        
-        # Flash attention computation in blocks
-        num_blocks = (seq_len + self.block_size - 1) // self.block_size
-        outputs = []
-        
-        for i in range(num_blocks):
-            start_idx = i * self.block_size
-            end_idx = tf.minimum(start_idx + self.block_size, seq_len)
-            
-            q_block = q[:, :, start_idx:end_idx, :]
-            mask_block = causal_mask[:, :, start_idx:end_idx, :]
-            
-            block_output, _ = self._flash_attention_block(q_block, k, v, mask_block)
-            outputs.append(block_output)
-        
-        # Concatenate block outputs
-        attn_output = tf.concat(outputs, axis=2)
-        
-        # Reshape and project
-        attn_output = tf.transpose(attn_output, [0, 2, 1, 3])
-        attn_output = tf.reshape(attn_output, [batch_size, seq_len, self.embed_dim])
-        
-        return self.out_proj(attn_output)
-
-class RotaryEmbedding(layers.Layer):
-    """Rotary Position Embedding (RoPE)."""
-    
-    def __init__(self, dim=None, max_seq_len=2048, **kwargs):
+    def __init__(self, dim, max_seq_len=2048, base=10000.0, **kwargs):
         super().__init__(**kwargs)
         self.dim = dim
         self.max_seq_len = max_seq_len
-
+        self.base = base
+        
     def build(self, input_shape):
-        if self.dim is None:
-            self.dim = int(input_shape[-1])
-        assert self.dim % 2 == 0, "RotaryEmbedding: dim must be even"
-        
-        inv_freq = 1.0 / (10000 ** (np.arange(0, self.dim // 2, dtype=np.float32) / (self.dim // 2)))
-        t = np.arange(self.max_seq_len, dtype=np.float32)
-        freqs = np.einsum('i,j->ij', t, inv_freq)
-        emb = np.concatenate([np.sin(freqs), np.cos(freqs)], axis=-1)
-        
-        self.rotary_emb = self.add_weight(
-            name="rotary_emb",
-            shape=emb.shape,
-            initializer=tf.constant_initializer(emb),
+        # Pre-compute frequency components
+        inv_freq = 1.0 / (self.base ** (tf.range(0, self.dim, 2, dtype=tf.float32) / self.dim))
+        self.inv_freq = self.add_weight(
+            name="inv_freq",
+            shape=inv_freq.shape,
+            initializer='zeros',
             trainable=False
         )
+        self.inv_freq.assign(inv_freq)
         super().build(input_shape)
-
-    def call(self, x):
-        seq_len = tf.shape(x)[1]
-        dim = tf.shape(x)[-1]
-        rotary = self.rotary_emb[:seq_len, :dim]
-        rotary = tf.expand_dims(rotary, 0)
         
-        x1, x2 = tf.split(x, 2, axis=-1)
-        sin, cos = tf.split(rotary, 2, axis=-1)
+    def call(self, x, seq_len=None):
+        """
+        Apply rotary position embedding to input tensor
+        x: [batch_size, seq_len, num_heads, head_dim]
+        """
+        if seq_len is None:
+            seq_len = tf.shape(x)[1]
         
-        return tf.concat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
-
-class MixtureOfExperts(layers.Layer):
-    """Enhanced Mixture of Experts with load balancing."""
+        # Create position indices
+        position = tf.range(seq_len, dtype=tf.float32)
+        position = tf.expand_dims(position, 1)  # [seq_len, 1]
+        
+        # Compute frequencies
+        freqs = tf.matmul(position, tf.expand_dims(self.inv_freq, 0))  # [seq_len, dim//2]
+        
+        # Create sin and cos
+        sin_vals = tf.sin(freqs)  # [seq_len, dim//2]
+        cos_vals = tf.cos(freqs)  # [seq_len, dim//2]
+        
+        # Expand dimensions for broadcasting
+        sin_vals = tf.expand_dims(tf.expand_dims(sin_vals, 0), 2)  # [1, seq_len, 1, dim//2]
+        cos_vals = tf.expand_dims(tf.expand_dims(cos_vals, 0), 2)  # [1, seq_len, 1, dim//2]
+        
+        # Apply rotary embedding
+        x_rotated = self._apply_rotary_pos_emb(x, sin_vals, cos_vals)
+        
+        return x_rotated
     
-    def __init__(self, d_model, d_ff, num_experts=8, k=2, dropout=0.1, **kwargs):
-        super().__init__(**kwargs)
-        self.num_experts = num_experts
-        self.k = k
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.dropout = dropout
+    def _apply_rotary_pos_emb(self, x, sin, cos):
+        """Apply the actual rotary transformation"""
+        # Split x into two halves
+        x1 = x[..., ::2]   # Even indices
+        x2 = x[..., 1::2]  # Odd indices
         
-        # Create experts
-        self.experts = []
-        for _ in range(num_experts):
-            expert = keras.Sequential([
-                layers.Dense(d_ff, activation='gelu'),
-                layers.Dropout(dropout),
-                layers.Dense(d_model),
-                layers.Dropout(dropout),
-            ])
-            self.experts.append(expert)
+        # Apply rotation
+        # cos * x + sin * rotate(x) where rotate swaps x1 and x2 with sign flip
+        rotated_x1 = cos * x1 - sin * x2
+        rotated_x2 = sin * x1 + cos * x2
         
-        self.gate = layers.Dense(num_experts)
-        self.load_balancing_loss_weight = 0.01
+        # Interleave back
+        rotated = tf.stack([rotated_x1, rotated_x2], axis=-1)
+        rotated = tf.reshape(rotated, tf.shape(x))
+        
+        return rotated
 
-    def call(self, x, training=None):
+class CustomMultiHeadAttention(layers.Layer):
+    """
+    Custom implementation of Multi-Head Attention mechanism from scratch.
+    Supports causal masking and padding masking.
+    """
+    
+    def __init__(self, num_heads, key_dim, value_dim=None, dropout=0.0, use_bias=True, 
+                 output_shape=None, attention_axes=None, kernel_initializer="glorot_uniform",
+                 bias_initializer="zeros", kernel_regularizer=None, bias_regularizer=None,
+                 activity_regularizer=None, kernel_constraint=None, bias_constraint=None,
+                 **kwargs):
+        super().__init__(**kwargs)
+        
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+        self.value_dim = value_dim if value_dim is not None else key_dim
+        self.dropout = dropout
+        self.use_bias = use_bias
+        self.output_shape = output_shape
+        self.attention_axes = attention_axes
+        self.kernel_initializer = kernel_initializer
+        self.bias_initializer = bias_initializer
+        self.kernel_regularizer = kernel_regularizer
+        self.bias_regularizer = bias_regularizer
+        self.activity_regularizer = activity_regularizer
+        self.kernel_constraint = kernel_constraint
+        self.bias_constraint = bias_constraint
+        
+        # Validate inputs
+        if self.num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {self.num_heads}")
+        if self.key_dim <= 0:
+            raise ValueError(f"key_dim must be positive, got {self.key_dim}")
+        if self.value_dim <= 0:
+            raise ValueError(f"value_dim must be positive, got {self.value_dim}")
+    
+    def build(self, input_shape):
+        # Get input dimensions
+        if isinstance(input_shape, list):
+            query_shape = input_shape[0]
+            key_shape = input_shape[1]
+            value_shape = input_shape[2]
+        else:
+            query_shape = input_shape
+            key_shape = input_shape
+            value_shape = input_shape
+        
+        # Get embedding dimension
+        self.embed_dim = query_shape[-1]
+        
+        # Validate embedding dimension
+        if self.embed_dim % self.num_heads != 0:
+            raise ValueError(
+                f"embedding dimension {self.embed_dim} must be divisible by number of heads {self.num_heads}"
+            )
+        
+        # Calculate dimensions for each head
+        self.head_dim = self.embed_dim // self.num_heads
+        
+        # Create projection matrices for Q, K, V
+        self.query_dense = layers.Dense(
+            self.embed_dim,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer,
+            bias_initializer=self.bias_initializer,
+            kernel_regularizer=self.kernel_regularizer,
+            bias_regularizer=self.bias_regularizer,
+            kernel_constraint=self.kernel_constraint,
+            bias_constraint=self.bias_constraint,
+            name="query"
+        )
+        
+        self.key_dense = layers.Dense(
+            self.embed_dim,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer,
+            bias_initializer=self.bias_initializer,
+            kernel_regularizer=self.kernel_regularizer,
+            bias_regularizer=self.bias_regularizer,
+            kernel_constraint=self.kernel_constraint,
+            bias_constraint=self.bias_constraint,
+            name="key"
+        )
+        
+        self.value_dense = layers.Dense(
+            self.embed_dim,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer,
+            bias_initializer=self.bias_initializer,
+            kernel_regularizer=self.kernel_regularizer,
+            bias_regularizer=self.bias_regularizer,
+            kernel_constraint=self.kernel_constraint,
+            bias_constraint=self.bias_constraint,
+            name="value"
+        )
+        
+        # Output projection
+        self.output_dense = layers.Dense(
+            self.embed_dim,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer,
+            bias_initializer=self.bias_initializer,
+            kernel_regularizer=self.kernel_regularizer,
+            bias_regularizer=self.bias_regularizer,
+            kernel_constraint=self.kernel_constraint,
+            bias_constraint=self.bias_constraint,
+            name="output"
+        )
+        
+        # Dropout layer
+        self.dropout_layer = layers.Dropout(self.dropout)
+        
+        super().build(input_shape)
+    
+    def call(self, inputs, mask=None, use_causal_mask=False, training=None):
+        """
+        Compute multi-head attention.
+        
+        Args:
+            inputs: Query tensor of shape [batch_size, seq_len, embed_dim]
+                   or list of [query, key, value] tensors
+            mask: Padding mask of shape [batch_size, seq_len] or [batch_size, seq_len, seq_len]
+            use_causal_mask: Whether to use causal masking
+            training: Whether the layer is in training mode
+        
+        Returns:
+            Output tensor of shape [batch_size, seq_len, embed_dim]
+        """
+        # Handle different input formats
+        if isinstance(inputs, list):
+            query, key, value = inputs
+        else:
+            query = key = value = inputs
+        
+        # Get shapes
+        batch_size = tf.shape(query)[0]
+        query_len = tf.shape(query)[1]
+        key_len = tf.shape(key)[1]
+        
+        # Project inputs to Q, K, V
+        query = self.query_dense(query)  # [batch_size, query_len, embed_dim]
+        key = self.key_dense(key)        # [batch_size, key_len, embed_dim]
+        value = self.value_dense(value)  # [batch_size, key_len, embed_dim]
+        
+        # Reshape for multi-head attention
+        query = tf.reshape(query, [batch_size, query_len, self.num_heads, self.head_dim])
+        key = tf.reshape(key, [batch_size, key_len, self.num_heads, self.head_dim])
+        value = tf.reshape(value, [batch_size, key_len, self.num_heads, self.head_dim])
+        
+        # Transpose for attention computation
+        query = tf.transpose(query, [0, 2, 1, 3])  # [batch_size, num_heads, query_len, head_dim]
+        key = tf.transpose(key, [0, 2, 1, 3])      # [batch_size, num_heads, key_len, head_dim]
+        value = tf.transpose(value, [0, 2, 1, 3])  # [batch_size, num_heads, key_len, head_dim]
+        
+        # Compute attention scores
+        scores = tf.matmul(query, key, transpose_b=True)  # [batch_size, num_heads, query_len, key_len]
+        
+        # Scale scores
+        scores = scores / tf.sqrt(tf.cast(self.head_dim, scores.dtype))
+        
+        # Apply masks
+        if mask is not None:
+            # Expand mask for broadcasting
+            if len(mask.shape) == 2:
+                mask = tf.expand_dims(tf.expand_dims(mask, 1), 1)
+            else:
+                mask = tf.expand_dims(mask, 1)
+            
+            # Convert mask to attention mask
+            attention_mask = (1.0 - tf.cast(mask, scores.dtype)) * -10000.0
+            scores = scores + attention_mask
+        
+        # Apply causal mask if requested
+        if use_causal_mask:
+            # Create causal mask
+            causal_mask = tf.linalg.band_part(
+                tf.ones((query_len, key_len)), -1, 0
+            )
+            causal_mask = tf.cast(causal_mask, scores.dtype)
+            causal_mask = tf.expand_dims(tf.expand_dims(causal_mask, 0), 0)
+            
+            # Apply causal mask
+            scores = scores * causal_mask + (1.0 - causal_mask) * -10000.0
+        
+        # Compute attention weights
+        attention_weights = tf.nn.softmax(scores, axis=-1)
+        
+        # Apply dropout to attention weights
+        attention_weights = self.dropout_layer(attention_weights, training=training)
+        
+        # Compute attention output
+        attention_output = tf.matmul(attention_weights, value)  # [batch_size, num_heads, query_len, head_dim]
+        
+        # Transpose and reshape
+        attention_output = tf.transpose(attention_output, [0, 2, 1, 3])  # [batch_size, query_len, num_heads, head_dim]
+        attention_output = tf.reshape(attention_output, [batch_size, query_len, self.embed_dim])
+        
+        # Final projection
+        output = self.output_dense(attention_output)
+        
+        return output
+    
+    def compute_output_shape(self, input_shape):
+        if isinstance(input_shape, list):
+            query_shape = input_shape[0]
+        else:
+            query_shape = input_shape
+        
+        return tf.TensorShape([*query_shape[:-1], self.embed_dim])
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_heads": self.num_heads,
+            "key_dim": self.key_dim,
+            "value_dim": self.value_dim,
+            "dropout": self.dropout,
+            "use_bias": self.use_bias,
+            "output_shape": self.output_shape,
+            "attention_axes": self.attention_axes,
+            "kernel_initializer": self.kernel_initializer,
+            "bias_initializer": self.bias_initializer,
+            "kernel_regularizer": self.kernel_regularizer,
+            "bias_regularizer": self.bias_regularizer,
+            "activity_regularizer": self.activity_regularizer,
+            "kernel_constraint": self.kernel_constraint,
+            "bias_constraint": self.bias_constraint,
+        })
+        return config
+
+class MultiHeadAttention(layers.Layer):
+    """Multi-head attention layer with custom attention implementation"""
+    
+    def __init__(self, embed_dim, num_heads, dropout=0.1, max_seq_len=2048, use_custom_attention=True, **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout_rate = dropout
+        self.use_custom_attention = use_custom_attention
+        
+        assert embed_dim % num_heads == 0
+        self.head_dim = embed_dim // num_heads
+        
+        # Query, Key, Value projections
+        self.query_proj = layers.Dense(embed_dim, name='query_proj')
+        self.key_proj = layers.Dense(embed_dim, name='key_proj')
+        self.value_proj = layers.Dense(embed_dim, name='value_proj')
+        
+        # Output projection
+        self.output_proj = layers.Dense(embed_dim, name='output_proj')
+        
+        # Rotary position embedding
+        self.rope = RotaryPositionalEmbedding(
+            dim=self.head_dim,
+            max_seq_len=max_seq_len,
+            name='rope'
+        )
+        
+        # Custom Multi-Head Attention layer
+        if use_custom_attention:
+            self.custom_attention = CustomMultiHeadAttention(
+                num_heads=num_heads,
+                key_dim=self.head_dim,
+                dropout=dropout,
+                name='custom_attention'
+            )
+        
+        # Dropout
+        self.dropout = layers.Dropout(dropout)
+        
+    def call(self, x, training=False):
         batch_size = tf.shape(x)[0]
         seq_len = tf.shape(x)[1]
-        x_flat = tf.reshape(x, [-1, self.d_model])
-        num_tokens = tf.shape(x_flat)[0]
         
-        # Gate computation
-        gate_logits = self.gate(x_flat)
-        gate_logits = gate_logits - tf.reduce_max(gate_logits, axis=-1, keepdims=True)
+        # Get Q, K, V
+        q = self.query_proj(x)
+        k = self.key_proj(x)
+        v = self.value_proj(x)
         
-        # Top-k gating
-        gate_top_k, gate_idx = tf.math.top_k(gate_logits, k=self.k)
-        gate_scores = tf.nn.softmax(gate_top_k, axis=-1)
+        # Reshape for multi-head attention
+        q = tf.reshape(q, (batch_size, seq_len, self.num_heads, self.head_dim))
+        k = tf.reshape(k, (batch_size, seq_len, self.num_heads, self.head_dim))
+        v = tf.reshape(v, (batch_size, seq_len, self.num_heads, self.head_dim))
         
-        # Load balancing loss
-        if training:
-            gate_probs = tf.nn.softmax(gate_logits, axis=-1)
-            expert_usage = tf.reduce_mean(gate_probs, axis=0)
-            cv_squared = tf.reduce_sum(expert_usage ** 2) * self.num_experts
-            self.add_loss(self.load_balancing_loss_weight * cv_squared)
+        # Apply RoPE to queries and keys
+        q = self.rope(q, seq_len)
+        k = self.rope(k, seq_len)
         
-        # Expert computation
-        expert_outputs = []
-        for expert in self.experts:
-            expert_out = expert(x_flat, training=training)
-            expert_outputs.append(expert_out)
-        expert_outputs = tf.stack(expert_outputs, axis=1)
+        # Transpose to (batch_size, num_heads, seq_len, head_dim)
+        q = tf.transpose(q, perm=[0, 2, 1, 3])
+        k = tf.transpose(k, perm=[0, 2, 1, 3])
+        v = tf.transpose(v, perm=[0, 2, 1, 3])
         
-        # Gather top-k expert outputs
-        batch_indices = tf.range(num_tokens)
-        batch_indices = tf.expand_dims(batch_indices, 1)
-        batch_indices = tf.tile(batch_indices, [1, self.k])
-        gather_idx = tf.stack([batch_indices, gate_idx], axis=-1)
+        # Create causal mask
+        mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
+        mask = tf.where(mask == 0, -1e9, 0.0)
+        mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)  # [1, 1, seq_len, seq_len]
         
-        topk_expert_outputs = tf.gather_nd(expert_outputs, gather_idx)
-        gate_scores_exp = tf.expand_dims(gate_scores, -1)
-        moe_out = tf.reduce_sum(topk_expert_outputs * gate_scores_exp, axis=1)
+        # Compute attention using Custom Multi-Head Attention or standard attention
+        if self.use_custom_attention:
+            attention = self.custom_attention([q, k, v], mask=mask, use_causal_mask=True, training=training)
+        else:
+            attention = self._scaled_dot_product_attention(q, k, v, mask, training)
         
-        moe_out = tf.reshape(moe_out, [batch_size, seq_len, self.d_model])
-        return moe_out
-
-@tf.recompute_grad
-def gradient_checkpoint_block(block_fn, *args, **kwargs):
-    """Wrapper for gradient checkpointing."""
-    return block_fn(*args, **kwargs)
-
-class TransformerDecoderBlock(layers.Layer):
-    """Enhanced Transformer decoder block with gradient checkpointing support."""
+        # Transpose back and reshape
+        attention = tf.transpose(attention, perm=[0, 2, 1, 3])
+        attention = tf.reshape(attention, (batch_size, seq_len, self.embed_dim))
+        
+        # Output projection
+        output = self.output_proj(attention)
+        
+        return output
     
-    def __init__(self, config: ModelConfig, **kwargs):
+    def _scaled_dot_product_attention(self, q, k, v, mask=None, training=False):
+        """Standard scaled dot-product attention (fallback)"""
+        # Compute attention scores
+        scores = tf.matmul(q, k, transpose_b=True)
+        scores = scores / tf.sqrt(tf.cast(self.head_dim, tf.float32))
+        
+        # Apply mask if provided
+        if mask is not None:
+            scores += mask
+        
+        # Apply softmax
+        attention_weights = tf.nn.softmax(scores, axis=-1)
+        
+        # Apply dropout
+        attention_weights = self.dropout(attention_weights, training=training)
+        
+        # Apply attention to values
+        output = tf.matmul(attention_weights, v)
+        
+        return output
+
+class FeedForward(layers.Layer):
+    """Feed-forward network"""
+    
+    def __init__(self, embed_dim, ffn_dim, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
-        self.config = config
+        self.embed_dim = embed_dim
+        self.ffn_dim = ffn_dim
         
-        self.ln1 = layers.LayerNormalization(epsilon=1e-5)
+        self.dense1 = layers.Dense(ffn_dim, activation='gelu', name='dense1')
+        self.dense2 = layers.Dense(embed_dim, name='dense2')
+        self.dropout = layers.Dropout(dropout)
         
-        if config.use_flash_attention:
-            self.attn = FlashAttention(
-                config.embed_dim, 
-                config.num_heads, 
-                config.block_size
-            )
-        else:
-            self.attn = layers.MultiHeadAttention(
-                config.num_heads, 
-                config.embed_dim // config.num_heads,
-                dropout=config.dropout
-            )
-        
-        self.ln2 = layers.LayerNormalization(epsilon=1e-5)
-        self.ffn = MixtureOfExperts(
-            config.embed_dim, 
-            config.ffn_dim, 
-            config.num_experts, 
-            dropout=config.dropout
-        )
-        
-        self.rotary_emb = RotaryEmbedding(config.embed_dim, config.max_seq_len)
+    def call(self, x, training=False):
+        x = self.dense1(x)
+        x = self.dropout(x, training=training)
+        x = self.dense2(x)
+        return x
 
-    def call(self, x, training=None):
-        if self.config.use_gradient_checkpointing and training:
-            return gradient_checkpoint_block(self._forward, x, training=training)
-        else:
-            return self._forward(x, training=training)
+class TransformerBlock(layers.Layer):
+    """Transformer block with attention and feed-forward layers"""
     
-    def _forward(self, x, training=None):
-        # Self-attention with residual connection
-        h = self.ln1(x)
-        
-        if self.config.use_flash_attention:
-            attn_out = self.attn(h, training=training)
-        else:
-            # Apply rotary embeddings for standard attention
-            h_rope = self.rotary_emb(h)
-            attn_out = self.attn(h_rope, h_rope, training=training)
-        
-        x = x + attn_out
-        
-        # Feed-forward with residual connection
-        h = self.ln2(x)
-        ffn_out = self.ffn(h, training=training)
-        return x + ffn_out
-
-class SentencePieceTokenizer:
-    """Advanced tokenizer using SentencePiece."""
-    
-    def __init__(self, vocab_size=32000, model_type='bpe'):
-        self.vocab_size = vocab_size
-        self.model_type = model_type
-        self.sp = None
-        
-    def train(self, texts: List[str], model_path: str = 'tokenizer'):
-        """Train SentencePiece tokenizer on texts."""
-        # Write texts to temporary file
-        with open('temp_corpus.txt', 'w', encoding='utf-8') as f:
-            for text in texts:
-                f.write(text + '\n')
-        
-        # Train SentencePiece model
-        sptokenizer.SentencePieceTrainer.train(
-            input='temp_corpus.txt',
-            model_prefix=model_path,
-            vocab_size=self.vocab_size,
-            model_type=self.model_type,
-            pad_id=0,
-            unk_id=1,
-            bos_id=2,
-            eos_id=3,
-            user_defined_symbols=['<HUMAN>', '<AI>']
-        )
-        
-        # Load trained model
-        self.sp = sptokenizer.SentencePieceProcessor()
-        self.sp.load(f'{model_path}.model')
-        
-        # Clean up
-        os.remove('temp_corpus.txt')
-        
-    def load(self, model_path: str):
-        """Load pre-trained tokenizer."""
-        self.sp = sptokenizer.SentencePieceProcessor()
-        self.sp.load(model_path)
-        
-    def encode(self, text: str) -> List[int]:
-        """Encode text to token IDs."""
-        if self.sp is None:
-            raise ValueError("Tokenizer not trained or loaded")
-        return self.sp.encode_as_ids(text)
-    
-    def decode(self, ids: List[int]) -> str:
-        """Decode token IDs to text."""
-        if self.sp is None:
-            raise ValueError("Tokenizer not trained or loaded")
-        return self.sp.decode_ids(ids)
-    
-    def get_vocab_size(self) -> int:
-        """Get vocabulary size."""
-        if self.sp is None:
-            return self.vocab_size
-        return self.sp.get_piece_size()
-
-class EnhancedMiniGPT(tf.keras.Model):
-    """Enhanced MiniGPT with advanced features."""
-    
-    def __init__(self, config: ModelConfig, **kwargs):
+    def __init__(self, embed_dim, num_heads, ffn_dim, dropout=0.1, layer_norm_epsilon=1e-5, max_seq_len=2048, **kwargs):
         super().__init__(**kwargs)
-        self.config = config
         
-        # Token embedding
-        self.embedding = layers.Embedding(
-            config.vocab_size, 
-            config.embed_dim,
-            embeddings_initializer='glorot_uniform'
+        # Multi-head attention with RoPE
+        self.attention = MultiHeadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+            use_custom_attention=True,
+            name='attention'
         )
         
-        # Transformer blocks
-        self.blocks = [
-            TransformerDecoderBlock(config, name=f'block_{i}')
-            for i in range(config.num_layers)
+        # Feed-forward network
+        self.ffn = FeedForward(
+            embed_dim=embed_dim,
+            ffn_dim=ffn_dim,
+            dropout=dropout,
+            name='ffn'
+        )
+        
+        # Layer normalization
+        self.ln1 = layers.LayerNormalization(epsilon=layer_norm_epsilon, name='ln1')
+        self.ln2 = layers.LayerNormalization(epsilon=layer_norm_epsilon, name='ln2')
+        
+        # Dropout
+        self.dropout = layers.Dropout(dropout)
+        
+    def call(self, x, training=False):
+        # Pre-norm attention
+        attn_input = self.ln1(x)
+        attn_output = self.attention(attn_input, training=training)
+        attn_output = self.dropout(attn_output, training=training)
+        x = x + attn_output
+        
+        # Pre-norm feed-forward
+        ffn_input = self.ln2(x)
+        ffn_output = self.ffn(ffn_input, training=training)
+        ffn_output = self.dropout(ffn_output, training=training)
+        x = x + ffn_output
+        
+        return x
+
+class EnhancedMiniGPT(Model):
+    """Enhanced MiniGPT model with improved architecture and optimizations"""
+    
+    def __init__(self, config: ModelConfig = None, **kwargs):
+        super().__init__(**kwargs)
+        self.config = config or ModelConfig()
+        
+        # Initialize tokenizer if available
+        if HAS_TRANSFORMERS:
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+                logger.info("Tokenizer loaded successfully")
+            except Exception as e:
+                logger.warning(f"Failed to load tokenizer: {e}")
+                self.tokenizer = None
+        else:
+            self.tokenizer = None
+        
+        # Token embeddings (no position embeddings needed with RoPE)
+        self.token_embedding = layers.Embedding(
+            self.config.vocab_size,
+            self.config.embed_dim,
+            name='token_embedding'
+        )
+        
+        # Transformer blocks with RoPE
+        self.transformer_blocks = [
+            TransformerBlock(
+                embed_dim=self.config.embed_dim,
+                num_heads=self.config.num_heads,
+                ffn_dim=self.config.ffn_dim,
+                dropout=self.config.dropout,
+                layer_norm_epsilon=self.config.layer_norm_epsilon,
+                max_seq_len=self.config.max_seq_len,
+                name=f'transformer_block_{i}'
+            ) for i in range(self.config.num_layers)
         ]
         
-        # Final layer norm and output head
-        self.ln_f = layers.LayerNormalization(epsilon=1e-5)
-        self.head = layers.Dense(config.vocab_size, use_bias=False, dtype='float32')
-
-    def call(self, x, training=None):
-        # Ensure input is int32
-        x = tf.cast(x, tf.int32)
+        # Final layer normalization
+        self.final_layer_norm = layers.LayerNormalization(
+            epsilon=self.config.layer_norm_epsilon,
+            name='final_layer_norm'
+        )
         
-        # Token embeddings
-        h = self.embedding(x)
+        # Output layer (language modeling head)
+        self.lm_head = layers.Dense(
+            self.config.vocab_size,
+            use_bias=False,
+            name='lm_head'
+        )
         
-        # Apply transformer blocks
-        for block in self.blocks:
-            h = block(h, training=training)
+        # Dropout
+        self.dropout = layers.Dropout(self.config.dropout)
         
-        # Final layer norm and output projection
-        h = self.ln_f(h)
-        logits = self.head(h)
+    def call(self, inputs, training=False):
+        """Forward pass with RoPE (no position embeddings needed)"""
+        # Get token embeddings only
+        x = self.token_embedding(inputs)
         
-        return tf.cast(logits, tf.float32)
+        # Apply dropout
+        x = self.dropout(x, training=training)
+        
+        # Apply transformer blocks (RoPE is applied inside attention)
+        for block in self.transformer_blocks:
+            x = block(x, training=training)
+        
+        # Apply final layer normalization
+        x = self.final_layer_norm(x)
+        
+        # Get logits
+        logits = self.lm_head(x)
+        
+        return logits
     
-    @tf.function
-    def generate_step(self, input_ids, temperature=1.0, top_k=40, top_p=0.9):
-        """Single generation step."""
-        logits = self(input_ids, training=False)
-        next_token_logits = logits[:, -1, :] / temperature
-        
-        # Top-k filtering
-        if top_k > 0:
-            top_k_values, _ = tf.math.top_k(next_token_logits, k=top_k)
-            min_top_k = top_k_values[:, -1:]
-            next_token_logits = tf.where(
-                next_token_logits < min_top_k,
-                tf.ones_like(next_token_logits) * -1e9,
-                next_token_logits
-            )
-        
-        # Top-p (nucleus) sampling
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = tf.nn.top_k(
-                next_token_logits, k=tf.shape(next_token_logits)[-1]
-            )
-            cumulative_probs = tf.cumsum(tf.nn.softmax(sorted_logits), axis=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove = tf.concat([
-                tf.zeros_like(sorted_indices_to_remove[:, :1]),
-                sorted_indices_to_remove[:, :-1]
-            ], axis=-1)
-            
-            indices_to_remove = tf.scatter_nd(
-                tf.expand_dims(sorted_indices, -1),
-                sorted_indices_to_remove,
-                tf.shape(next_token_logits)
-            )
-            next_token_logits = tf.where(
-                indices_to_remove,
-                tf.ones_like(next_token_logits) * -1e9,
-                next_token_logits
-            )
-        
-        # Sample next token
-        probs = tf.nn.softmax(next_token_logits)
-        next_token = tf.random.categorical(tf.math.log(probs + 1e-8), num_samples=1)
-        
-        return next_token
+    def build_model(self):
+        """Build the model by calling it with dummy input"""
+        dummy_input = tf.zeros((1, self.config.max_seq_len), dtype=tf.int32)
+        _ = self(dummy_input)
+        logger.info(f"Model built successfully with {self.count_params():,} parameters")
     
-    def generate_text(self, input_ids, max_length=100, temperature=1.0, top_k=40, top_p=0.9):
-        """Generate text with advanced sampling."""
-        generated = input_ids
+    def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7, 
+                 top_k: int = 50, top_p: float = 0.9, pad_token_id: int = 0):
+        """Generate text continuation"""
+        # Ensure input is tensor
+        if not isinstance(input_ids, tf.Tensor):
+            input_ids = tf.constant(input_ids, dtype=tf.int32)
         
+        # Ensure batch dimension
+        if len(input_ids.shape) == 1:
+            input_ids = tf.expand_dims(input_ids, 0)
+        
+        batch_size = tf.shape(input_ids)[0]
+        current_length = tf.shape(input_ids)[1]
+        
+        # Generate tokens
         for _ in range(max_length):
-            # Trim context if too long
-            if tf.shape(generated)[1] >= self.config.max_seq_len:
-                generated = generated[:, -self.config.max_seq_len//2:]
+            # Truncate input if too long
+            if current_length >= self.config.max_seq_len:
+                input_ids = input_ids[:, -self.config.max_seq_len+1:]
+                current_length = tf.shape(input_ids)[1]
             
-            next_token = self.generate_step(generated, temperature, top_k, top_p)
-            generated = tf.concat([generated, next_token], axis=1)
+            # Get model predictions
+            logits = self(input_ids, training=False)
+            next_token_logits = logits[:, -1, :] / temperature
             
-            # Stop on end token
-            if next_token[0][0] == 3:  # EOS token
+            # Apply top-k filtering
+            if top_k > 0:
+                top_k_logits, top_k_indices = tf.nn.top_k(next_token_logits, k=top_k)
+                next_token_logits = tf.where(
+                    next_token_logits < tf.reduce_min(top_k_logits, axis=-1, keepdims=True),
+                    -float('inf'),
+                    next_token_logits
+                )
+            
+            # Sample next token
+            next_token = tf.random.categorical(next_token_logits, num_samples=1, dtype=tf.int32)
+            
+            # Append to input
+            input_ids = tf.concat([input_ids, next_token], axis=1)
+            current_length += 1
+            
+            # Check for pad token (simple stopping condition)
+            if tf.reduce_all(next_token == pad_token_id):
                 break
         
-        return generated
-
-class EvaluationSuite:
-    """Comprehensive evaluation suite for language models."""
+        return input_ids
     
-    def __init__(self, model: EnhancedMiniGPT, tokenizer: SentencePieceTokenizer):
+    def generate_text(self, prompt: str, max_length: int = 100, temperature: float = 0.7):
+        """Generate text from a string prompt (requires tokenizer)"""
+        if not self.tokenizer:
+            raise ValueError("Tokenizer not available. Install transformers library or use generate() with token IDs.")
+        
+        # Tokenize input
+        input_ids = self.tokenizer.encode(prompt, return_tensors='tf')
+        
+        # Generate
+        generated_ids = self.generate(input_ids, max_length, temperature)
+        
+        # Decode and return
+        return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    
+    def chat(self, message: str, max_length: int = 100, temperature: float = 0.7) -> str:
+        """Chat with the model (requires tokenizer)"""
+        if not self.tokenizer:
+            raise ValueError("Tokenizer not available. Install transformers library.")
+        
+        # Format input
+        prompt = f"Human: {message}\nAssistant:"
+        
+        # Generate response
+        response = self.generate_text(prompt, max_length, temperature)
+        
+        # Extract assistant response
+        try:
+            response = response.split("Assistant:")[-1].strip()
+        except:
+            response = response.strip()
+        
+        return response
+    
+    def compute_loss(self, input_ids, labels=None):
+        """Compute language modeling loss"""
+        if labels is None:
+            # For language modeling, labels are input_ids shifted by one
+            labels = input_ids[:, 1:]
+            input_ids = input_ids[:, :-1]
+        
+        # Get logits
+        logits = self(input_ids, training=True)
+        
+        # Compute loss
+        loss = tf.keras.losses.sparse_categorical_crossentropy(
+            labels, logits, from_logits=True
+        )
+        
+        return tf.reduce_mean(loss)
+
+# Training utilities
+class MiniGPTTrainer:
+    """Training utilities for MiniGPT"""
+    
+    def __init__(self, model: EnhancedMiniGPT, learning_rate: float = 1e-4):
         self.model = model
-        self.tokenizer = tokenizer
-        
-    def perplexity(self, texts: List[str]) -> float:
-        """Calculate perplexity on test texts."""
-        total_loss = 0.0
-        total_tokens = 0
-        
-        for text in texts:
-            tokens = self.tokenizer.encode(text)
-            if len(tokens) < 2:
-                continue
-                
-            input_ids = tf.constant([tokens[:-1]], dtype=tf.int32)
-            targets = tf.constant([tokens[1:]], dtype=tf.int32)
-            
-            logits = self.model(input_ids, training=False)
-            loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                labels=targets, logits=logits
-            )
-            
-            total_loss += tf.reduce_sum(loss).numpy()
-            total_tokens += len(tokens) - 1
-        
-        avg_loss = total_loss / total_tokens
-        return np.exp(avg_loss)
+        self.optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=learning_rate,
+            weight_decay=0.01,
+            beta_1=0.9,
+            beta_2=0.95
+        )
     
-    def bleu_score(self, references: List[str], candidates: List[str]) -> float:
-        """Calculate BLEU score (simplified implementation)."""
-        def n_gram_precision(ref_tokens, cand_tokens, n):
-            if len(cand_tokens) < n:
-                return 0.0
-            
-            ref_ngrams = {}
-            for i in range(len(ref_tokens) - n + 1):
-                ngram = tuple(ref_tokens[i:i+n])
-                ref_ngrams[ngram] = ref_ngrams.get(ngram, 0) + 1
-            
-            cand_ngrams = {}
-            for i in range(len(cand_tokens) - n + 1):
-                ngram = tuple(cand_tokens[i:i+n])
-                cand_ngrams[ngram] = cand_ngrams.get(ngram, 0) + 1
-            
-            matches = 0
-            for ngram, count in cand_ngrams.items():
-                matches += min(count, ref_ngrams.get(ngram, 0))
-            
-            return matches / max(len(cand_tokens) - n + 1, 1)
+    @tf.function
+    def train_step(self, batch):
+        """Single training step"""
+        input_ids = batch['input_ids']
         
-        total_score = 0.0
-        for ref, cand in zip(references, candidates):
-            ref_tokens = ref.split()
-            cand_tokens = cand.split()
-            
-            # Calculate precision for n-grams 1 to 4
-            precisions = []
-            for n in range(1, 5):
-                precisions.append(n_gram_precision(ref_tokens, cand_tokens, n))
-            
-            # Geometric mean of precisions
-            if all(p > 0 for p in precisions):
-                bleu = np.exp(np.mean(np.log(precisions)))
-                
-                # Brevity penalty
-                bp = min(1.0, np.exp(1 - len(ref_tokens) / max(len(cand_tokens), 1)))
-                bleu *= bp
-            else:
-                bleu = 0.0
-            
-            total_score += bleu
+        with tf.GradientTape() as tape:
+            loss = self.model.compute_loss(input_ids)
         
-        return total_score / len(references)
+        # Compute gradients
+        gradients = tape.gradient(loss, self.model.trainable_variables)
+        
+        # Clip gradients
+        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
+        
+        # Apply gradients
+        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        
+        return loss
     
-    def generation_quality(self, prompts: List[str], num_samples=5) -> Dict:
-        """Evaluate generation quality metrics."""
-        all_generations = []
+    def train(self, dataset, epochs: int = 1, steps_per_epoch: int = None):
+        """Train the model"""
+        logger.info(f"Starting training for {epochs} epochs")
         
-        for prompt in prompts:
-            prompt_tokens = self.tokenizer.encode(prompt)
-            input_ids = tf.constant([prompt_tokens], dtype=tf.int32)
+        for epoch in range(epochs):
+            epoch_loss = 0
+            num_steps = 0
             
-            for _ in range(num_samples):
-                generated = self.model.generate_text(
-                    input_ids, max_length=50, temperature=0.8
-                )
-                generated_text = self.tokenizer.decode(generated[0].numpy().tolist())
-                all_generations.append(generated_text)
-        
-        # Calculate diversity metrics
-        unique_generations = set(all_generations)
-        diversity = len(unique_generations) / len(all_generations)
-        
-        # Average length
-        avg_length = np.mean([len(text.split()) for text in all_generations])
-        
-        return {
-            "diversity": diversity,
-            "average_length": avg_length,
-            "total_generations": len(all_generations),
-            "unique_generations": len(unique_generations)
-        }
-    
-    def benchmark_speed(self, batch_sizes=[1, 4, 8], seq_lengths=[128, 256, 512]) -> Dict:
-        """Benchmark model inference speed."""
-        results = {}
-        
-        for batch_size in batch_sizes:
-            for seq_len in seq_lengths:
-                key = f"batch_{batch_size}_seq_{seq_len}"
+            for step, batch in enumerate(dataset):
+                if steps_per_epoch and step >= steps_per_epoch:
+                    break
                 
-                # Create dummy input
-                dummy_input = tf.random.uniform(
-                    (batch_size, seq_len), 
-                    maxval=self.tokenizer.get_vocab_size(), 
-                    dtype=tf.int32
-                )
+                loss = self.train_step(batch)
+                epoch_loss += loss
+                num_steps += 1
                 
-                # Warmup
-                for _ in range(3):
-                    _ = self.model(dummy_input, training=False)
-                
-                # Benchmark
-                start_time = time.time()
-                num_runs = 10
-                for _ in range(num_runs):
-                    _ = self.model(dummy_input, training=False)
-                
-                elapsed = time.time() - start_time
-                tokens_per_second = (batch_size * seq_len * num_runs) / elapsed
-                
-                results[key] = {
-                    "tokens_per_second": tokens_per_second,
-                    "elapsed_time": elapsed / num_runs,
-                    "batch_size": batch_size,
-                    "sequence_length": seq_len
-                }
-        
-        return results
+                if step % 100 == 0:
+                    logger.info(f"Epoch {epoch+1}, Step {step}, Loss: {loss:.4f}")
+            
+            avg_loss = epoch_loss / num_steps
+            logger.info(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
 
-def create_training_dataset(texts: List[str], tokenizer: SentencePieceTokenizer, 
-                          max_length: int = 512, batch_size: int = 8):
-    """Create training dataset with proper preprocessing."""
-    
-    def tokenize_function(text):
-        tokens = tokenizer.encode(text.numpy().decode('utf-8'))
-        
-        # Truncate or pad to max_length
-        if len(tokens) > max_length:
-            tokens = tokens[:max_length]
-        else:
-            tokens.extend([0] * (max_length - len(tokens)))  # Pad with 0
-            
-        return tokens
-    
-    def py_tokenize(text):
-        return tf.py_function(tokenize_function, [text], tf.int32)
-    
-    # Create dataset
-    dataset = tf.data.Dataset.from_tensor_slices(texts)
-    dataset = dataset.map(py_tokenize, num_parallel_calls=tf.data.AUTOTUNE)
-    dataset = dataset.batch(batch_size)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    
-    return dataset
-
-def create_optimizer_with_schedule(config: ModelConfig, steps_per_epoch: int):
-    """Create optimizer with learning rate schedule and mixed precision."""
-    
-    # Learning rate schedule
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=1e-4,
-        decay_steps=steps_per_epoch * 100,  # 100 epochs
-        alpha=0.1
-    )
-    
-    # Optimizer with mixed precision
-    optimizer = tf.keras.optimizers.AdamW(
-        learning_rate=lr_schedule,
-        weight_decay=0.01,
-        beta_1=0.9,
-        beta_2=0.95,
-        epsilon=1e-8
-    )
-    
-    # Wrap optimizer for mixed precision
-    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
-    
-    return optimizer
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Create model configuration
+# Example usage
+def create_model_and_test():
+    """Create model and run basic tests"""
+    # Create config
     config = ModelConfig(
-        vocab_size=32000,
+        vocab_size=50257,
         max_seq_len=512,
         embed_dim=512,
         num_heads=8,
-        num_layers=6,
+        num_layers=6,  # Smaller for testing
         ffn_dim=2048,
-        num_experts=4,
-        use_flash_attention=True,
-        use_gradient_checkpointing=True
+        dropout=0.1
     )
     
-    # Initialize model
+    # Create model
     model = EnhancedMiniGPT(config)
+    model.build_model()
     
-    # Sample data for testing
-    sample_texts = [
-        "Hello, how are you today?",
-        "The weather is nice outside.",
-        "Machine learning is fascinating.",
-        "I love programming in Python.",
-        "Natural language processing is amazing."
-    ]
+    # Test forward pass
+    test_input = tf.random.uniform((2, 64), minval=0, maxval=config.vocab_size, dtype=tf.int32)
+    output = model(test_input)
+    print(f"Model output shape: {output.shape}")
     
-    # Initialize and train tokenizer
-    tokenizer = SentencePieceTokenizer(vocab_size=config.vocab_size)
-    # Note: In practice, you would use a much larger corpus
-    # tokenizer.train(sample_texts, 'my_tokenizer')
+    # Test generation
+    prompt_ids = tf.constant([[1, 2, 3, 4, 5]], dtype=tf.int32)
+    generated = model.generate(prompt_ids, max_length=20)
+    print(f"Generated sequence shape: {generated.shape}")
     
-    # Create evaluation suite
-    # evaluator = EvaluationSuite(model, tokenizer)
-    
-    print("Enhanced MiniGPT model created successfully!")
-    print(f"Model parameters: {model.count_params():,}")
-    print(f"Configuration: {config}")
+    return model
+
+if __name__ == "__main__":
+    model = create_model_and_test()

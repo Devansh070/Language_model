@@ -6,8 +6,13 @@ from datetime import datetime
 import json
 import logging
 import datasets
-from datasets import disable_caching
-from minigpt_transformer import EnhancedMiniGPT, SentencePieceTokenizer, ModelConfig
+from datasets import disable_caching, load_dataset
+from minigpt_transformer import EnhancedMiniGPT, ModelConfig
+from transformers import AutoTokenizer
+import time
+from tqdm import tqdm
+import psutil
+import gc
 
 # Disable datasets caching to prevent disk space issues
 disable_caching()
@@ -15,6 +20,12 @@ disable_caching()
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def log_memory_usage():
+    """Log current memory usage"""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    logger.info(f"Memory usage: {memory_info.rss / 1024 / 1024:.2f} MB")
 
 # Configure GPU/CPU settings
 def setup_gpu():
@@ -34,34 +45,35 @@ def setup_gpu():
         logger.info("Falling back to CPU")
         return False
 
-# Training configuration for large model
+# Training configuration aligned with ModelConfig
 TRAINING_CONFIG = {
-    'batch_size': 32,  # Reduced for large model
-    'num_epochs': 5,   # Reduced for large datasets
-    'learning_rate': 0.00005,  # Lower learning rate for stability
-    'max_seq_len': 512,  # Increased for better context
-    'target_tokens': 10000000,  # 10M tokens target
-    'max_samples_per_dataset': 100000,  # Limit per dataset to manage memory
+    'batch_size': 32,
+    'num_epochs': 5,
+    'learning_rate': 1e-4,
+    'max_seq_len': 512,
+    'target_tokens': 10000000,
+    'max_samples_per_dataset': 100000,
+    'validation_split': 0.1,  # 10% validation split
 }
 
-def safe_dataset_load(dataset_name, config_name=None, split="train", max_samples=None):
-    """Safely load dataset with proper error handling"""
+def safe_dataset_load(dataset_name, split='train', max_samples=10000):
+    """Safely load a dataset with error handling and progress tracking"""
     try:
-        cache_dir = os.path.join(os.getcwd(), "dataset_cache")
-        os.makedirs(cache_dir, exist_ok=True)
+        logger.info(f"Loading dataset: {dataset_name}")
+        start_time = time.time()
         
-        if config_name:
-            dataset = datasets.load_dataset(dataset_name, config_name, split=split, cache_dir=cache_dir)
-        else:
-            dataset = datasets.load_dataset(dataset_name, split=split, cache_dir=cache_dir)
+        # Load dataset with progress tracking
+        dataset = load_dataset(dataset_name, split=split, streaming=False)
         
-        # Limit dataset size if specified
+        # Take subset if specified
         if max_samples and len(dataset) > max_samples:
             dataset = dataset.select(range(max_samples))
-            
+        
+        load_time = time.time() - start_time
+        logger.info(f"Successfully loaded {len(dataset)} samples from {dataset_name} in {load_time:.2f} seconds")
         return dataset
     except Exception as e:
-        logger.error(f"Failed to load {dataset_name}: {e}")
+        logger.error(f"Error loading dataset {dataset_name}: {str(e)}")
         return None
 
 def extract_conversations_from_dataset(dataset, dataset_name):
@@ -92,8 +104,7 @@ def extract_conversations_from_dataset(dataset, dataset_name):
                                 a_text = str(dialog[i+1]).strip() if i+1 < len(dialog) else ''
                             
                             if q_text and a_text and len(q_text) > 2 and len(a_text) > 2:
-                                texts.append(f"Q: {q_text}")
-                                texts.append(f"A: {a_text}")
+                                texts.append(f"Q: {q_text}\nA: {a_text}")
                 
                 elif 'conversations' in example:
                     # Handle conversation datasets like ShareGPT
@@ -101,51 +112,61 @@ def extract_conversations_from_dataset(dataset, dataset_name):
                     if isinstance(convs, list) and len(convs) >= 2:
                         for i in range(0, len(convs)-1, 2):
                             if i+1 < len(convs):
-                                q_text = str(convs[i]).strip()
-                                a_text = str(convs[i+1]).strip()
+                                if isinstance(convs[i], dict) and isinstance(convs[i+1], dict):
+                                    q_text = convs[i].get('value', '').strip()
+                                    a_text = convs[i+1].get('value', '').strip()
+                                else:
+                                    q_text = str(convs[i]).strip()
+                                    a_text = str(convs[i+1]).strip()
                                 if q_text and a_text:
-                                    texts.append(f"Q: {q_text}")
-                                    texts.append(f"A: {a_text}")
+                                    texts.append(f"Q: {q_text}\nA: {a_text}")
                 
                 elif 'utterance' in example and 'context' in example:
                     # Handle empathetic dialogues
                     context = example['context'].strip()
                     utterance = example['utterance'].strip()
                     if context and utterance:
-                        texts.append(f"Q: {context}")
-                        texts.append(f"A: {utterance}")
+                        texts.append(f"Q: {context}\nA: {utterance}")
                 
                 elif 'prompt' in example and 'response' in example:
                     # Handle prompt-response datasets
                     prompt = example['prompt'].strip()
                     response = example['response'].strip()
                     if prompt and response:
-                        texts.append(f"Q: {prompt}")
-                        texts.append(f"A: {response}")
+                        texts.append(f"Q: {prompt}\nA: {response}")
                 
                 elif 'input' in example and 'output' in example:
                     # Handle input-output datasets
                     inp = example['input'].strip()
                     out = example['output'].strip()
                     if inp and out:
-                        texts.append(f"Q: {inp}")
-                        texts.append(f"A: {out}")
+                        texts.append(f"Q: {inp}\nA: {out}")
                 
                 elif 'text' in example and 'summary' in example:
                     # Handle text-summary datasets
                     text = example['text'].strip()
                     summary = example['summary'].strip()
                     if text and summary:
-                        texts.append(f"Q: Summarize this: {text}")
-                        texts.append(f"A: {summary}")
+                        texts.append(f"Q: Summarize this: {text}\nA: {summary}")
                 
                 elif 'question' in example and 'answer' in example:
                     # Handle Q&A datasets
                     question = example['question'].strip()
                     answer = example['answer'].strip()
                     if question and answer:
-                        texts.append(f"Q: {question}")
-                        texts.append(f"A: {answer}")
+                        texts.append(f"Q: {question}\nA: {answer}")
+                
+                elif 'instruction' in example:
+                    # Handle Alpaca-style datasets
+                    instruction = example['instruction'].strip()
+                    output = example.get('output', '').strip()
+                    inp = example.get('input', '').strip()
+                    
+                    if instruction and output:
+                        if inp:
+                            texts.append(f"Q: {instruction}\nInput: {inp}\nA: {output}")
+                        else:
+                            texts.append(f"Q: {instruction}\nA: {output}")
                 
                 # Progress logging
                 if (idx + 1) % 10000 == 0:
@@ -162,378 +183,198 @@ def extract_conversations_from_dataset(dataset, dataset_name):
         logger.error(f"Failed to extract from {dataset_name}: {e}")
         return []
 
-def load_all_conversation_datasets():
-    """Load all available conversation datasets"""
-    logger.info("Loading conversation datasets...")
-    all_texts = []
-    total_tokens = 0
-    
-    # Define datasets to try loading
-    datasets_config = [
-        # Core conversation datasets
-        ("daily_dialog", None),           # DailyDialog
-        ("empathetic_dialogues", None),   # Empathetic Dialogues
-        ("conv_ai_2", None),             # ConvAI2
-        ("PygmalionAI/PIPPA", None),     # PIPPA
-        ("OpenAssistant/oasst1", None),  # OpenAssistant Conversations
-        ("HuggingFaceH4/ultrachat_200k", None),  # GPT-4/GPT-3.5 Augmented
+def load_all_conversation_datasets(max_samples=10000):
+    """Load all conversation datasets with progress tracking"""
+    datasets_to_try = [
+        'daily_dialog',
+        'empathetic_dialogues',
+        'tatsu-lab/alpaca',
     ]
     
-    for dataset_name, config_name in datasets_config:
-        try:
-            logger.info(f"Attempting to load {dataset_name}" + (f" ({config_name})" if config_name else ""))
-            
-            dataset = safe_dataset_load(
-                dataset_name, 
-                config_name, 
-                max_samples=TRAINING_CONFIG['max_samples_per_dataset']
-            )
-            
-            if dataset is not None:
-                texts = extract_conversations_from_dataset(dataset, dataset_name)
-                if texts:
-                    all_texts.extend(texts)
-                    
-                    # Calculate tokens and check if we've reached target
-                    current_tokens = sum(len(text.split()) for text in texts)
-                    total_tokens += current_tokens
-                    
-                    logger.info(f"Added {len(texts):,} texts ({current_tokens:,} tokens) from {dataset_name}")
-                    logger.info(f"Total: {len(all_texts):,} texts, {total_tokens:,} tokens")
-                    
-                    # Check if we've reached our token target
-                    if total_tokens >= TRAINING_CONFIG['target_tokens']:
-                        logger.info(f"Reached target of {TRAINING_CONFIG['target_tokens']:,} tokens")
-                        break
-            
-            # Clean up memory
-            del dataset
-            
-        except Exception as e:
-            logger.error(f"Failed to process {dataset_name}: {e}")
-            continue
+    all_texts = []
+    total_samples = 0
     
-    # Add fallback conversation data if we don't have enough
-    if len(all_texts) < 1000:
-        logger.warning("Adding fallback conversation data...")
-        fallback_texts = create_fallback_conversation_data()
-        all_texts.extend(fallback_texts)
-        total_tokens += sum(len(text.split()) for text in fallback_texts)
+    for dataset_name in datasets_to_try:
+        dataset = safe_dataset_load(dataset_name, max_samples=max_samples)
+        if dataset is not None:
+            texts = extract_conversations_from_dataset(dataset, dataset_name)
+            all_texts.extend(texts)
+            total_samples += len(texts)
+            logger.info(f"Added {len(texts)} samples from {dataset_name}")
     
-    logger.info(f"Final dataset: {len(all_texts):,} texts, {total_tokens:,} tokens")
+    # If no datasets loaded, create some simple training data
+    if len(all_texts) == 0:
+        logger.warning("No datasets loaded, creating simple training data")
+        all_texts = [
+            "Q: What is the capital of France?\nA: The capital of France is Paris.",
+            "Q: How are you?\nA: I'm doing well, thank you for asking!",
+            "Q: What is machine learning?\nA: Machine learning is a branch of artificial intelligence.",
+            "Q: Tell me a joke.\nA: Why don't scientists trust atoms? Because they make up everything!",
+            "Q: What's 2+2?\nA: 2+2 equals 4.",
+        ] * 1000  # Repeat for more training data
+    
+    logger.info(f"Total samples collected: {len(all_texts)}")
     return all_texts
 
-def create_fallback_conversation_data():
-    """Create fallback conversation data"""
-    logger.info("Creating fallback conversation data...")
-    
-    conversation_patterns = [
-        ("Hello", "Hi there! How can I help you today?"),
-        ("Hi", "Hello! Nice to meet you. What's on your mind?"),
-        ("How are you?", "I'm doing well, thank you for asking! How about you?"),
-        ("What's your name?", "I'm an AI assistant. You can call me Assistant."),
-        ("Can you help me?", "Absolutely! I'm here to help. What do you need assistance with?"),
-        ("Thank you", "You're very welcome! Is there anything else I can help you with?"),
-        ("Tell me a joke", "Why don't scientists trust atoms? Because they make up everything!"),
-        ("What's the weather like?", "I don't have access to current weather data, but you can check a weather app."),
-        ("What time is it?", "I don't have access to the current time. Please check your device's clock."),
-        ("Goodbye", "Goodbye! It was wonderful chatting with you. Take care!"),
-        ("Good morning", "Good morning! I hope you're having a great day so far."),
-        ("Good night", "Good night! Sleep well and sweet dreams."),
-        ("How old are you?", "I'm an AI, so I don't have an age in the traditional sense."),
-        ("Where are you from?", "I exist in the digital realm, created by my developers."),
-        ("What can you do?", "I can help answer questions, have conversations, and assist with various tasks."),
-        ("I'm sad", "I'm sorry to hear you're feeling sad. Would you like to talk about what's bothering you?"),
-        ("I'm happy", "That's wonderful to hear! I'm glad you're feeling happy today."),
-        ("Tell me about yourself", "I'm an AI assistant designed to be helpful, harmless, and honest."),
-        ("What's your favorite color?", "I don't have personal preferences, but I find all colors fascinating in their own way."),
-        ("Do you like music?", "I think music is a beautiful form of human expression and creativity."),
-    ]
-    
-    texts = []
-    # Create substantial fallback data
-    for _ in range(1000):
-        for q, a in conversation_patterns:
-            texts.append(f"Q: {q}")
-            texts.append(f"A: {a}")
-    
-    logger.info(f"Created {len(texts)} fallback texts")
-    return texts
-
-def create_training_sequences(texts, tokenizer, seq_len, batch_size=1000):
-    """Create training sequences in batches to manage memory"""
+def create_sequences(texts, tokenizer, max_length=512, batch_size=1000):
+    """Create training sequences using the tokenizer"""
     logger.info("Creating training sequences...")
+    start_time = time.time()
     
-    inputs, targets = [], []
-    pad_token_id = 0
+    all_sequences = []
     total_tokens = 0
     
     # Process in batches to manage memory
-    for batch_start in range(0, len(texts), batch_size * 2):  # *2 because we process Q&A pairs
-        batch_end = min(batch_start + batch_size * 2, len(texts))
-        batch_texts = texts[batch_start:batch_end]
+    for i in tqdm(range(0, len(texts), batch_size), desc="Processing batches"):
+        batch_texts = texts[i:i + batch_size]
         
-        logger.info(f"Processing batch {batch_start//batch_size + 1}/{(len(texts) + batch_size*2 - 1)//(batch_size*2)}")
+        # Tokenize batch
+        encoded = tokenizer(
+            batch_texts,
+            max_length=max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='tf'
+        )
         
-        for i in range(0, len(batch_texts)-1, 2):
-            if i+1 < len(batch_texts):
-                try:
-                    # Get question and answer
-                    question = batch_texts[i].replace("Q: ", "").strip()
-                    answer = batch_texts[i+1].replace("A: ", "").strip()
-                    
-                    # Skip very short or very long sequences
-                    if len(question) < 3 or len(answer) < 3:
-                        continue
-                    if len(question) > 1000 or len(answer) > 1000:
-                        continue
-                    
-                    # Combine into training text
-                    combined_text = f"{question} {answer}"
-                    
-                    # Tokenize using SentencePieceTokenizer
-                    sequence = tokenizer.encode(combined_text)
-                    
-                    if len(sequence) > 1:
-                        total_tokens += len(sequence)
-                        
-                        # Pad or truncate to seq_len + 1
-                        if len(sequence) <= seq_len:
-                            padded = sequence + [pad_token_id] * (seq_len + 1 - len(sequence))
-                        else:
-                            padded = sequence[:seq_len + 1]
-                        
-                        # Create input-target pairs (shift by 1)
-                        inputs.append(padded[:-1])
-                        targets.append(padded[1:])
-                    
-                except Exception as e:
-                    logger.warning(f"Error processing sequence: {e}")
-                    continue
+        # Add to sequences
+        all_sequences.extend(encoded['input_ids'])
+        total_tokens += tf.reduce_sum(tf.cast(encoded['attention_mask'], tf.int32))
+        
+        # Log memory usage periodically
+        if i % (batch_size * 10) == 0:
+            log_memory_usage()
+            gc.collect()
     
-    logger.info(f"Created {len(inputs):,} training sequences with {total_tokens:,} tokens")
-    return np.array(inputs, dtype=np.int32), np.array(targets, dtype=np.int32)
+    logger.info(f"Created {len(all_sequences)} sequences with {total_tokens} tokens in {time.time() - start_time:.2f} seconds")
+    return tf.data.Dataset.from_tensor_slices(all_sequences)
 
 def masked_sparse_categorical_crossentropy(y_true, y_pred):
-    """Masked loss function for padded sequences"""
+    """Custom loss function that ignores padding tokens"""
     mask = tf.cast(tf.not_equal(y_true, 0), tf.float32)
     loss = tf.keras.losses.sparse_categorical_crossentropy(y_true, y_pred, from_logits=True)
-    masked_loss = loss * mask
-    return tf.reduce_sum(masked_loss) / (tf.reduce_sum(mask) + 1e-8)
+    loss = loss * mask
+    return tf.reduce_sum(loss) / tf.reduce_sum(mask)
 
 def masked_accuracy(y_true, y_pred):
-    """Masked accuracy for padded sequences"""
-    predictions = tf.argmax(y_pred, axis=-1, output_type=tf.int32)
+    """Custom accuracy metric that ignores padding tokens"""
     mask = tf.cast(tf.not_equal(y_true, 0), tf.float32)
-    correct = tf.cast(tf.equal(y_true, predictions), tf.float32) * mask
-    return tf.reduce_sum(correct) / (tf.reduce_sum(mask) + 1e-8)
+    pred = tf.argmax(y_pred, axis=-1)
+    correct = tf.cast(tf.equal(y_true, pred), tf.float32)
+    return tf.reduce_sum(correct * mask) / tf.reduce_sum(mask)
 
 def train_model():
-    """Main training function for large model"""
-    logger.info("=== STARTING LARGE MINIGPT TRAINING ===")
-    
+    """Main training function"""
     try:
-        # Setup hardware
-        gpu_available = setup_gpu()
+        # Setup GPU
+        has_gpu = setup_gpu()
         
-        # Set TensorFlow memory management
-        tf.config.threading.set_inter_op_parallelism_threads(0)  # Use all available cores
-        tf.config.threading.set_intra_op_parallelism_threads(0)
+        # Load and initialize tokenizer
+        logger.info("Initializing tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
         
         # Load datasets
         logger.info("Loading conversation datasets...")
-        texts = load_all_conversation_datasets()
+        texts = load_all_conversation_datasets(max_samples=TRAINING_CONFIG['max_samples_per_dataset'])
         
         if len(texts) == 0:
-            raise ValueError("No training data loaded")
-        
-        # Initialize tokenizer
-        logger.info("Creating and fitting tokenizer...")
-        tokenizer = SentencePieceTokenizer()
-        
-        # Train tokenizer in batches to manage memory
-        batch_size = 10000
-        temp_text_file = "temp_training_texts.txt"
-        
-        try:
-            # Write texts to temporary file for training
-            with open(temp_text_file, 'w', encoding='utf-8') as f:
-                for i in range(0, len(texts), batch_size):
-                    batch_texts = texts[i:i+batch_size]
-                    for text in batch_texts:
-                        f.write(text + '\n')
-                    logger.info(f"Wrote batch {i//batch_size + 1} to temp file")
-            
-            # Train tokenizer on the file
-            logger.info("Training tokenizer...")
-            tokenizer.train(texts, model_path='tokenizer')
-            
-            # Load the trained tokenizer
-            tokenizer.load('tokenizer')
-            
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_text_file):
-                os.remove(temp_text_file)
-        
-        vocab_size = tokenizer.get_vocab_size()
-        logger.info(f"Final vocabulary size: {vocab_size:,}")
-        
-        # Update config
-        TRAINING_CONFIG['vocab_size'] = vocab_size
+            raise ValueError("No texts loaded from datasets")
         
         # Create training sequences
         logger.info("Creating training sequences...")
-        X_train, y_train = create_training_sequences(texts, tokenizer, TRAINING_CONFIG['max_seq_len'])
+        sequences = create_sequences(texts, tokenizer)
         
-        if len(X_train) == 0:
+        if len(sequences) == 0:
             raise ValueError("No training sequences created")
         
-        logger.info(f"Training data shape: {X_train.shape}")
-        logger.info(f"Target data shape: {y_train.shape}")
+        logger.info(f"Training data shape: {sequences.element_spec}")
         
         # Free up memory
         del texts
+        gc.collect()
         
-        # Create dataset with memory optimization
-        logger.info("Creating optimized TensorFlow dataset...")
-        train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train))
-        train_dataset = (train_dataset
-                        .shuffle(buffer_size=1000)  # Smaller buffer for memory
-                        .batch(TRAINING_CONFIG['batch_size'])
-                        .prefetch(tf.data.AUTOTUNE)
-                        .cache())  # Cache for better performance
+        # Split into train and validation
+        val_size = int(len(sequences) * TRAINING_CONFIG['validation_split'])
+        train_dataset = sequences.skip(val_size).shuffle(buffer_size=1000)
+        val_dataset = sequences.take(val_size)
         
-        # Build large model
-        logger.info("Building large MiniGPT model...")
+        # Create optimized datasets
+        train_dataset = train_dataset.batch(TRAINING_CONFIG['batch_size']).prefetch(tf.data.AUTOTUNE)
+        val_dataset = val_dataset.batch(TRAINING_CONFIG['batch_size']).prefetch(tf.data.AUTOTUNE)
+        
+        # Create model configuration
         config = ModelConfig(
-            vocab_size=vocab_size,
+            vocab_size=tokenizer.vocab_size,
             max_seq_len=TRAINING_CONFIG['max_seq_len'],
             embed_dim=512,
             num_heads=8,
             num_layers=12,
             ffn_dim=2048,
-            num_experts=4,
             dropout=0.1,
-            block_size=128,
-            use_flash_attention=True,
-            use_gradient_checkpointing=True
-        )
-        model = EnhancedMiniGPT(config)
-        
-        # Compile with optimization for large model
-        logger.info("Compiling model...")
-        optimizer = tf.keras.optimizers.AdamW(
-            learning_rate=TRAINING_CONFIG['learning_rate'],
-            weight_decay=0.01,
-            clipnorm=1.0
+            layer_norm_epsilon=1e-5,
+            use_custom_attention=True  # Enable Custom Multi-Head Attention
         )
         
+        # Build model
+        logger.info("Building MiniGPT model...")
+        model = EnhancedMiniGPT(config=config)
+        
+        # Compile model with custom metrics
         model.compile(
-            optimizer=optimizer,
+            optimizer=tf.keras.optimizers.Adam(learning_rate=TRAINING_CONFIG['learning_rate']),
             loss=masked_sparse_categorical_crossentropy,
-            metrics=[masked_accuracy],
-            jit_compile=False  # Disable for better debugging
+            metrics=[masked_accuracy]
         )
         
-        # Advanced callbacks for large model training
+        # Create callbacks
         callbacks = [
+            tf.keras.callbacks.ModelCheckpoint(
+                'minigpt_checkpoint_{epoch}',
+                save_weights_only=True,
+                save_best_only=True,
+                monitor='val_loss'
+            ),
             tf.keras.callbacks.EarlyStopping(
-                monitor='loss',
-                patience=2,
-                restore_best_weights=True,
-                verbose=1
+                monitor='val_loss',
+                patience=3,
+                restore_best_weights=True
             ),
             tf.keras.callbacks.ReduceLROnPlateau(
-                monitor='loss',
+                monitor='val_loss',
                 factor=0.5,
-                patience=1,
-                min_lr=1e-7,
-                verbose=1
+                patience=2,
+                min_lr=1e-6
             ),
-            tf.keras.callbacks.ModelCheckpoint(
-                filepath='minigpt_checkpoint_epoch_{epoch:02d}.weights.h5',
-                monitor='loss',
-                save_best_only=True,
-                save_weights_only=True,
-                verbose=1
-            ),
-            tf.keras.callbacks.CSVLogger(
-                'training_log.csv',
-                append=True
+            tf.keras.callbacks.TensorBoard(
+                log_dir='./logs',
+                histogram_freq=1
             )
         ]
         
-        # Train model
-        logger.info(f"Starting training for {TRAINING_CONFIG['num_epochs']} epochs...")
-        logger.info(f"Batch size: {TRAINING_CONFIG['batch_size']}")
-        logger.info(f"Learning rate: {TRAINING_CONFIG['learning_rate']}")
-        
+        # Train model with validation
+        logger.info("Starting training...")
         history = model.fit(
             train_dataset,
+            validation_data=val_dataset,
             epochs=TRAINING_CONFIG['num_epochs'],
-            callbacks=callbacks,
-            verbose=1
+            callbacks=callbacks
         )
         
-        # Save everything
-        logger.info("Saving model and tokenizer...")
+        # Save final model
+        model.save_weights('minigpt_final')
         
-        # Save final model weights
-        model.save_weights('minigpt_final_large.weights.h5')
-        logger.info("Model weights saved to 'minigpt_final_large.weights.h5'")
+        # Save training history
+        with open('training_history.json', 'w') as f:
+            json.dump(history.history, f)
         
-        # Save tokenizer
-        with open('minigpt_tokenizer_large.pkl', 'wb') as f:
-            pickle.dump(tokenizer, f)
-        logger.info("Tokenizer saved to 'minigpt_tokenizer_large.pkl'")
-        
-        # Save detailed configuration
-        config_to_save = TRAINING_CONFIG.copy()
-        config_to_save['training_samples'] = len(X_train)
-        config_to_save['final_loss'] = float(history.history['loss'][-1])
-        config_to_save['final_accuracy'] = float(history.history['masked_accuracy'][-1])
-        config_to_save['training_history'] = {
-            'loss': [float(x) for x in history.history['loss']],
-            'masked_accuracy': [float(x) for x in history.history['masked_accuracy']]
-        }
-        config_to_save['timestamp'] = datetime.now().isoformat()
-        config_to_save['gpu_used'] = gpu_available
-        
-        with open('minigpt_training_config_large.json', 'w') as f:
-            json.dump(config_to_save, f, indent=2)
-        logger.info("Training config saved to 'minigpt_training_config_large.json'")
-        
-        logger.info("=== LARGE MODEL TRAINING COMPLETED SUCCESSFULLY ===")
-        logger.info(f"Final loss: {history.history['loss'][-1]:.6f}")
-        logger.info(f"Final accuracy: {history.history['masked_accuracy'][-1]:.6f}")
-        
-        return model, tokenizer, history
+        logger.info("Training completed successfully!")
+        return model, history
         
     except Exception as e:
-        logger.error(f"Training failed with error: {str(e)}")
+        logger.error(f"Training failed: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    try:
-        # Set TensorFlow logging level
-        tf.get_logger().setLevel('ERROR')
-        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-        
-        # Run training
-        model, tokenizer, history = train_model()
-        
-        print("\n" + "="*60)
-        print("LARGE MODEL TRAINING COMPLETED SUCCESSFULLY!")
-        print("="*60)
-        print("Files saved:")
-        print("- minigpt_final_large.weights.h5 (final model weights)")
-        print("- minigpt_tokenizer_large.pkl (tokenizer)")
-        print("- minigpt_training_config_large.json (detailed configuration)")
-        print("- minigpt_checkpoint_epoch_*.weights.h5 (epoch checkpoints)")
-        print("- training_log.csv (training metrics log)")
-        
-    except Exception as e:
-        print(f"\nTRAINING FAILED: {e}")
-        logger.error(f"Main execution failed: {e}")
-        exit(1)
+    train_model()
