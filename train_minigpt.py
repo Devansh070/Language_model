@@ -21,14 +21,15 @@ from minigpt_transformer import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def create_dummy_dataset(vocab_size=50257, seq_len=512, batch_size=32, num_samples=1000):
+def create_dummy_dataset(vocab_size=50257, seq_len=512, batch_size=8, num_samples=1000):
     """Create a dummy dataset for testing"""
     def data_generator():
         for _ in range(num_samples):
-            # Generate random sequences
-            sequence = np.random.randint(0, vocab_size, size=seq_len, dtype=np.int32)
-            yield {'input_ids': sequence}
+            # Generate random input sequence
+            input_seq = np.random.randint(0, vocab_size, size=seq_len, dtype=np.int32)
+            yield {'input_ids': input_seq}
     
+    # Create dataset
     dataset = tf.data.Dataset.from_generator(
         data_generator,
         output_signature={
@@ -38,36 +39,29 @@ def create_dummy_dataset(vocab_size=50257, seq_len=512, batch_size=32, num_sampl
     
     return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-def create_text_dataset(text_file_path, tokenizer, seq_len=512, batch_size=32):
-    """Create dataset from text file"""
-    try:
+def create_text_dataset(text_file_path, tokenizer, seq_len=512, batch_size=8):
+    """Create a dataset from a text file."""
+    def data_generator():
         with open(text_file_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        
-        # Tokenize the entire text
-        tokens = tokenizer.encode(text)
-        
-        # Create sequences
-        sequences = []
-        for i in range(0, len(tokens) - seq_len, seq_len // 2):  # 50% overlap
-            sequences.append(tokens[i:i + seq_len])
-        
-        def data_generator():
-            for seq in sequences:
-                yield {'input_ids': np.array(seq, dtype=np.int32)}
-        
-        dataset = tf.data.Dataset.from_generator(
-            data_generator,
-            output_signature={
-                'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
-            }
-        )
-        
-        return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            for line in f:
+                # Tokenize text
+                tokens = tokenizer.encode(line.strip())
+                if len(tokens) < seq_len:
+                    continue
+                
+                # Create sequences with overlap
+                for i in range(0, len(tokens) - seq_len, seq_len // 2):
+                    yield {'input_ids': tokens[i:i + seq_len]}
     
-    except Exception as e:
-        logger.warning(f"Failed to create text dataset: {e}")
-        return None
+    # Create dataset
+    dataset = tf.data.Dataset.from_generator(
+        data_generator,
+        output_signature={
+            'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
+        }
+    )
+    
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 class CustomModelCheckpoint(tf.keras.callbacks.Callback):
     """Custom checkpoint callback that saves both weights and full model"""
@@ -564,7 +558,7 @@ if __name__ == "__main__":
         use_custom_attention=True,
         use_rotary_embeddings=True,
         learning_rate=1e-4,
-        batch_size=32,
+        batch_size=8,  # Reduced from 32 to 8 (75% reduction)
         seq_len=1024
     )
     

@@ -2,9 +2,10 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 import os
 import logging
+import time
 
 # Optional: only import if transformers is available
 try:
@@ -34,7 +35,7 @@ class ModelConfig:
         use_custom_attention: bool = True,
         use_rotary_embeddings: bool = True,
         learning_rate: float = 1e-4,
-        batch_size: int = 32,
+        batch_size: int = 8,
         seq_len: int = 1024
     ):
         self.vocab_size = vocab_size
@@ -703,3 +704,44 @@ class EnhancedMiniGPT(Model):
         )
         
         return tf.reduce_mean(loss)
+
+    def benchmark_speed(self, batch_sizes=[1, 2, 4, 8], seq_lengths=[128, 256, 512]) -> Dict:
+        """Benchmark model speed with different batch sizes and sequence lengths."""
+        results = {}
+        
+        for batch_size in batch_sizes:
+            for seq_len in seq_lengths:
+                key = f"batch_{batch_size}_seq_{seq_len}"
+                
+                # Create dummy input
+                input_ids = tf.random.uniform(
+                    (batch_size, seq_len),
+                    minval=0,
+                    maxval=self.config.vocab_size,
+                    dtype=tf.int32
+                )
+                
+                # Warmup
+                for _ in range(3):
+                    _ = self(input_ids, training=False)
+                
+                # Benchmark
+                num_runs = 10
+                start_time = time.time()
+                
+                for _ in range(num_runs):
+                    _ = self(input_ids, training=False)
+                
+                elapsed = time.time() - start_time
+                
+                # Calculate metrics
+                tokens_per_second = (batch_size * seq_len * num_runs) / elapsed
+                
+                results[key] = {
+                    "tokens_per_second": tokens_per_second,
+                    "batch_size": batch_size,
+                    "seq_len": seq_len,
+                    "elapsed_time": elapsed
+                }
+        
+        return results
