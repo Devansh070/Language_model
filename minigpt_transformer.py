@@ -458,152 +458,213 @@ class FeedForward(layers.Layer):
         x = self.dense2(x)
         return x
 
-class TransformerBlock(layers.Layer):
-    """Transformer block with attention and feed-forward layers"""
+class TransformerBlock(tf.keras.layers.Layer):
+    """Transformer block with optional custom attention and rotary embeddings."""
     
-    def __init__(self, embed_dim, num_heads, ffn_dim, dropout=0.1, layer_norm_epsilon=1e-5, max_seq_len=2048, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        dropout_rate: float = 0.1,
+        use_custom_attention: bool = True,
+        use_rotary_embeddings: bool = True,
+        name: str = None,
+        **kwargs
+    ):
+        # Remove custom arguments from kwargs before passing to parent
+        custom_kwargs = {
+            'use_custom_attention': use_custom_attention,
+            'use_rotary_embeddings': use_rotary_embeddings
+        }
+        for key in custom_kwargs:
+            kwargs.pop(key, None)
+            
+        super().__init__(name=name, **kwargs)
         
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.ff_dim = ff_dim
+        self.dropout_rate = dropout_rate
+        self.use_custom_attention = use_custom_attention
+        self.use_rotary_embeddings = use_rotary_embeddings
+        
+        # Create layers
+        if use_custom_attention:
+            self.attention = CustomMultiHeadAttention(
+                num_heads=num_heads,
+                key_dim=embed_dim // num_heads,
+                use_rotary_embeddings=use_rotary_embeddings
+            )
+        else:
+            self.attention = tf.keras.layers.MultiHeadAttention(
+                num_heads=num_heads,
+                key_dim=embed_dim // num_heads
+            )
+            
+        self.ffn = tf.keras.Sequential([
+            tf.keras.layers.Dense(ff_dim, activation='gelu'),
+            tf.keras.layers.Dense(embed_dim)
+        ])
+        
+        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.dropout1 = tf.keras.layers.Dropout(dropout_rate)
+        self.dropout2 = tf.keras.layers.Dropout(dropout_rate)
+        
+    def call(self, inputs, mask=None, training=False):
+        # Apply attention
+        attention_output = self.attention(
+            inputs, inputs,
+            attention_mask=mask,
+            training=training
+        )
+        attention_output = self.dropout1(attention_output, training=training)
+        out1 = self.layernorm1(inputs + attention_output)
+        
+        # Apply feed-forward network
+        ffn_output = self.ffn(out1)
+        ffn_output = self.dropout2(ffn_output, training=training)
+        return self.layernorm2(out1 + ffn_output)
+        
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'embed_dim': self.embed_dim,
+            'num_heads': self.num_heads,
+            'ff_dim': self.ff_dim,
+            'dropout_rate': self.dropout_rate,
+            'use_custom_attention': self.use_custom_attention,
+            'use_rotary_embeddings': self.use_rotary_embeddings
+        })
         # Multi-head attention with RoPE
         self.attention = MultiHeadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            max_seq_len=max_seq_len,
-            use_custom_attention=True,
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
+            dropout=self.dropout_rate,
+            max_seq_len=2048,
+            use_custom_attention=self.use_custom_attention,
             name='attention'
         )
         
         # Feed-forward network
         self.ffn = FeedForward(
-            embed_dim=embed_dim,
-            ffn_dim=ffn_dim,
-            dropout=dropout,
+            embed_dim=self.embed_dim,
+            ffn_dim=self.ff_dim,
+            dropout=self.dropout_rate,
             name='ffn'
         )
         
         # Layer normalization
-        self.ln1 = layers.LayerNormalization(epsilon=layer_norm_epsilon, name='ln1')
-        self.ln2 = layers.LayerNormalization(epsilon=layer_norm_epsilon, name='ln2')
+        self.ln1 = layers.LayerNormalization(epsilon=1e-6, name='ln1')
+        self.ln2 = layers.LayerNormalization(epsilon=1e-6, name='ln2')
         
         # Dropout
-        self.dropout = layers.Dropout(dropout)
+        self.dropout = layers.Dropout(self.dropout_rate)
         
-    def call(self, x, training=False, mask=None):
-        # Pre-norm attention
-        attn_input = self.ln1(x)
-        attn_output = self.attention(attn_input, training=training)
-        attn_output = self.dropout(attn_output, training=training)
-        x = x + attn_output
-        
-        # Pre-norm feed-forward
-        ffn_input = self.ln2(x)
-        ffn_output = self.ffn(ffn_input, training=training)
-        ffn_output = self.dropout(ffn_output, training=training)
-        x = x + ffn_output
-        
-        return x
+        return config
 
 class EnhancedMiniGPT(tf.keras.Model):
-    """Enhanced MiniGPT model with custom attention and rotary embeddings."""
+    """Enhanced MiniGPT model with improved architecture and features."""
     
-    def __init__(self, config: ModelConfig):
-        super().__init__()
+    def __init__(self, config: ModelConfig, **kwargs):
+        super().__init__(name="enhanced_minigpt", **kwargs)
         self.config = config
+        self.batch_size = 2  # Set default batch size to 2
         
-        # Token embeddings
-        self.token_embedding = layers.Embedding(
+        # Token and positional embeddings
+        self.token_embedding = tf.keras.layers.Embedding(
             config.vocab_size,
             config.embed_dim,
-            dtype='float32'  # Keep embeddings in float32 for stability
+            name="token_embedding"
         )
-        
-        # Positional embeddings
-        self.pos_embedding = RotaryPositionalEmbedding(
-            config.embed_dim,
+        self.position_embedding = tf.keras.layers.Embedding(
             config.max_seq_len,
-            dtype='float32'  # Keep positional embeddings in float32
+            config.embed_dim,
+            name="position_embedding"
         )
         
         # Transformer blocks
-        self.transformer_blocks = [
-            TransformerBlock(
-                config.embed_dim,
-                config.num_heads,
-                config.ffn_dim,
-                config.dropout,
-                use_custom_attention=config.use_custom_attention,
-                use_rotary_embeddings=config.use_rotary_embeddings,
-                layer_norm_epsilon=config.layer_norm_epsilon,
-                dtype='float32'  # Keep transformer blocks in float32
+        self.transformer_blocks = []
+        for i in range(config.num_layers):
+            block = TransformerBlock(
+                embed_dim=config.embed_dim,
+                num_heads=config.num_heads,
+                ff_dim=config.ff_dim,
+                dropout_rate=config.dropout,
+                use_custom_attention=True,
+                use_rotary_embeddings=True,
+                name=f"transformer_block_{i}"
             )
-            for _ in range(config.num_layers)
-        ]
+            self.transformer_blocks.append(block)
         
-        # Final layer norm
-        self.final_layer_norm = layers.LayerNormalization(
-            epsilon=config.layer_norm_epsilon,
-            dtype='float32'  # Keep layer norm in float32
-        )
-        
-        # Output layer
-        self.output_layer = layers.Dense(
+        # Output layers
+        self.layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.output_layer = tf.keras.layers.Dense(
             config.vocab_size,
-            dtype='float32'  # Keep output layer in float32
+            name="output_layer"
         )
         
-        # Initialize tokenizer if transformers is available
+        # Initialize tokenizer if available
         try:
             from transformers import GPT2Tokenizer
             self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
         except ImportError:
+            logger.warning("transformers library not available, tokenizer not initialized")
             self.tokenizer = None
-            logger.warning("Transformers library not available. Tokenizer not initialized.")
     
     def call(self, inputs, training=False, mask=None):
-        """Forward pass of the model."""
-        # Convert inputs to float32 for embeddings
-        input_ids = tf.cast(inputs, tf.int32)
+        # Get input shape and ensure batch size is 2
+        batch_size = tf.shape(inputs)[0]
+        if batch_size != 2:
+            logger.warning(f"Expected batch size 2, got {batch_size}. Adjusting input.")
+            inputs = tf.slice(inputs, [0, 0], [2, -1])
+            batch_size = 2
+            
+        seq_len = tf.shape(inputs)[1]
         
-        # Get sequence length
-        seq_len = tf.shape(input_ids)[1]
+        # Create position indices
+        positions = tf.range(0, seq_len, dtype=tf.int32)
+        positions = tf.expand_dims(positions, 0)
+        positions = tf.tile(positions, [batch_size, 1])
         
-        # Token embeddings
-        token_embeddings = self.token_embedding(input_ids)  # [batch_size, seq_len, embed_dim]
+        # Get embeddings
+        token_embeddings = self.token_embedding(inputs)
+        position_embeddings = self.position_embedding(positions)
         
-        # Apply positional embeddings
-        token_embeddings = self.pos_embedding(token_embeddings)
+        # Combine embeddings
+        x = token_embeddings + position_embeddings
         
         # Apply transformer blocks
-        x = token_embeddings
         for block in self.transformer_blocks:
-            x = block(x, training=training, mask=mask)
+            x = block(x, mask=mask, training=training)
         
-        # Final layer norm
-        x = self.final_layer_norm(x)
-        
-        # Output layer
+        # Final layer norm and output
+        x = self.layernorm(x)
         logits = self.output_layer(x)
         
         return logits
-        
+    
     def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7,
-                top_k: int = 50, top_p: float = 0.9, **kwargs):
+                top_k: int = 50, top_p: float = 0.9, batch_size: int = 2):
         """Generate text using the model."""
-        batch_size = tf.shape(input_ids)[0]
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not initialized")
+            
+        # Ensure batch size is 2
+        if batch_size != 2:
+            logger.warning(f"Adjusting batch size from {batch_size} to 2")
+            batch_size = 2
+            
+        # Initialize generation
+        generated = tf.identity(input_ids)
         current_length = tf.shape(input_ids)[1]
         
-        # Initialize output sequence
-        output_sequence = input_ids
-        
         # Generate tokens
-        for _ in range(max_length):
+        for _ in range(max_length - current_length):
             # Get model predictions
-            logits = self(output_sequence, training=False)
-            next_token_logits = logits[:, -1, :]
-            
-            # Apply temperature
-            next_token_logits = next_token_logits / temperature
+            logits = self(generated, training=False)
+            next_token_logits = logits[:, -1, :] / temperature
             
             # Apply top-k filtering
             if top_k > 0:
@@ -626,15 +687,23 @@ class EnhancedMiniGPT(tf.keras.Model):
             probs = tf.nn.softmax(next_token_logits, axis=-1)
             next_token = tf.random.categorical(probs, num_samples=1)
             
-            # Append to output sequence
-            output_sequence = tf.concat([output_sequence, next_token], axis=1)
+            # Append to generated sequence
+            generated = tf.concat([generated, next_token], axis=1)
             
-            # Check if we should stop
-            if tf.reduce_any(next_token == self.config.vocab_size - 1):  # EOS token
+            # Check for end of sequence token
+            if tf.reduce_any(next_token == self.tokenizer.eos_token_id):
                 break
         
-        return output_sequence
-        
+        return generated
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'config': self.config,
+            'batch_size': self.batch_size
+        })
+        return config
+
     def generate_text(self, prompt: str, max_length: int = 512, batch_size: int = 8):
         """Generate text from a prompt."""
         if self.tokenizer is None:
