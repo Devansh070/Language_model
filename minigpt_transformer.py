@@ -124,14 +124,6 @@ class CustomMultiHeadAttention(layers.Layer):
         self.activity_regularizer = activity_regularizer
         self.kernel_constraint = kernel_constraint
         self.bias_constraint = bias_constraint
-        
-        # Validate inputs
-        if self.num_heads <= 0:
-            raise ValueError(f"num_heads must be positive, got {self.num_heads}")
-        if self.key_dim <= 0:
-            raise ValueError(f"key_dim must be positive, got {self.key_dim}")
-        if self.value_dim <= 0:
-            raise ValueError(f"value_dim must be positive, got {self.value_dim}")
     
     def build(self, input_shape):
         # Get input dimensions
@@ -375,13 +367,6 @@ class MultiHeadAttention(layers.Layer):
             mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)  # [1, 1, seq_len, seq_len]
             
             attention = self.custom_attention(x, mask=mask, use_causal_mask=True, training=training)
-            
-            # Apply RoPE to the attention output (approximation)
-            # Note: This is not the ideal place for RoPE, but works as a fallback
-            attention_reshaped = tf.reshape(attention, (batch_size, seq_len, self.num_heads, self.head_dim))
-            attention_rope = self.rope(attention_reshaped, seq_len)
-            attention = tf.reshape(attention_rope, (batch_size, seq_len, self.embed_dim))
-            
             return attention
         else:
             # Standard attention with RoPE
