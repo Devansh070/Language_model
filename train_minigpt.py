@@ -227,188 +227,98 @@ def load_conversation_datasets():
     
     return all_texts
 
-def create_dataset_from_texts(texts, tokenizer, seq_len=512, batch_size=32):
-    """Create dataset from list of texts."""
+def create_dataset_from_texts(texts, tokenizer, seq_len, batch_size):
+    """Create a TensorFlow dataset from a list of texts."""
     try:
-        sequences = []
-        
-        for text in texts:
-            if not isinstance(text, str):
-                continue
-                
-            # Tokenize text
-            try:
-                tokens = tokenizer.encode(text)
-            except Exception as e:
-                logger.warning(f"Failed to tokenize text: {e}")
-                continue
+        if not texts:
+            logger.warning("No texts provided for dataset creation")
+            return None
             
-            # Create sequences with overlap
-            for i in range(0, len(tokens) - seq_len, seq_len // 2):
-                sequences.append(tokens[i:i + seq_len])
+        # Filter out non-string texts
+        texts = [text for text in texts if isinstance(text, str)]
+        if not texts:
+            logger.warning("No valid texts after filtering")
+            return None
+            
+        # Create sequences
+        sequences = []
+        for text in texts:
+            try:
+                # Tokenize text
+                tokens = tokenizer.encode(text)
+                if not tokens:
+                    continue
+                    
+                # Create sequences of length seq_len
+                for i in range(0, len(tokens) - seq_len + 1, seq_len):
+                    sequence = tokens[i:i + seq_len]
+                    if len(sequence) == seq_len:  # Only add complete sequences
+                        sequences.append(sequence)
+            except Exception as e:
+                logger.warning(f"Error processing text: {e}")
+                continue
         
         if not sequences:
             logger.warning("No valid sequences created from texts")
             return None
+            
+        # Convert to TensorFlow dataset
+        dataset = tf.data.Dataset.from_tensor_slices(sequences)
+        dataset = dataset.map(lambda x: {'input_ids': x})
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(tf.data.AUTOTUNE)
         
-        def data_generator():
-            for seq in sequences:
-                yield {'input_ids': np.array(seq, dtype=np.int32)}
-        
-        dataset = tf.data.Dataset.from_generator(
-            data_generator,
-            output_signature={
-                'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
-            }
-        )
-        
-        return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-        
+        return dataset
     except Exception as e:
-        logger.error(f"Failed to create dataset: {e}")
+        logger.error(f"Error creating dataset: {e}")
         return None
 
-def train_model():
-    """Train the MiniGPT model."""
-    # Create model configuration
-    config = ModelConfig(
-        vocab_size=50257,  # GPT-2 vocabulary size
-        max_seq_len=1024,
-        embed_dim=768,
-        num_heads=12,
-        num_layers=12,
-        ffn_dim=3072,
-        dropout=0.1,
-        use_custom_attention=True,
-        use_rotary_embeddings=True
-    )
-    
-    # Create model
-    model = EnhancedMiniGPT(config)
-    
-    # Check if tokenizer is available
-    if model.tokenizer is None:
-        logger.warning("No tokenizer available. Using dummy dataset for testing.")
-        train_dataset = create_dummy_dataset(
-            vocab_size=config.vocab_size,
-            seq_len=config.max_seq_len,
-            batch_size=32
-        )
-        val_dataset = create_dummy_dataset(
-            vocab_size=config.vocab_size,
-            seq_len=config.max_seq_len,
-            batch_size=32,
-            num_samples=200
-        )
-    else:
-        # Load datasets
-        texts = load_conversation_datasets()
-        
-        if not texts:
-            logger.warning("No texts loaded from datasets. Using dummy dataset for testing.")
-            train_dataset = create_dummy_dataset(
-                vocab_size=config.vocab_size,
-                seq_len=config.max_seq_len,
-                batch_size=32
-            )
-            val_dataset = create_dummy_dataset(
-                vocab_size=config.vocab_size,
-                seq_len=config.max_seq_len,
-                batch_size=32,
-                num_samples=200
-            )
-        else:
-            # Split into train and validation
-            split_idx = int(len(texts) * 0.9)  # 90% train, 10% validation
-            train_texts = texts[:split_idx]
-            val_texts = texts[split_idx:]
-            
-            # Create datasets
-            train_dataset = create_dataset_from_texts(
-                train_texts,
-                model.tokenizer,
-                seq_len=config.max_seq_len,
-                batch_size=32
-            )
-            val_dataset = create_dataset_from_texts(
-                val_texts,
-                model.tokenizer,
-                seq_len=config.max_seq_len,
-                batch_size=32
-            )
-    
-    # Create optimizer with learning rate schedule
-    optimizer = tf.keras.optimizers.Adam(
-        learning_rate=1e-4,
-        beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-8
-    )
-    
-    # Create loss function
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+def train_model(model, config):
+    """Train the model."""
+    # Create optimizer
+    optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
     
     # Create metrics
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_perplexity = tf.keras.metrics.Mean(name='train_perplexity')
     train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
-    
     val_loss = tf.keras.metrics.Mean(name='val_loss')
     val_perplexity = tf.keras.metrics.Mean(name='val_perplexity')
     val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
     
-    # Create checkpoint manager
+    # Create checkpoint
     checkpoint_dir = './checkpoints'
+    os.makedirs(checkpoint_dir, exist_ok=True)
     checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
     checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
     
-    # Create TensorBoard writer
-    current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
-    train_log_dir = os.path.join('logs', 'gradient_tape', current_time, 'train')
-    val_log_dir = os.path.join('logs', 'gradient_tape', current_time, 'val')
+    # Create summary writers
+    train_log_dir = './logs/train'
+    val_log_dir = './logs/val'
     train_summary_writer = tf.summary.create_file_writer(train_log_dir)
     val_summary_writer = tf.summary.create_file_writer(val_log_dir)
     
-    # Training loop
-    @tf.function
-    def train_step(input_ids, labels):
-        with tf.GradientTape() as tape:
-            # Forward pass
-            logits = model(input_ids, training=True)
-            
-            # Compute loss
-            loss = loss_fn(labels, logits)
-            
-            # Add regularization losses
-            loss += tf.reduce_sum(model.losses)
-        
-        # Compute gradients
-        gradients = tape.gradient(loss, model.trainable_variables)
-        
-        # Apply gradients
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        
-        # Update metrics
-        train_loss.update_state(loss)
-        train_perplexity.update_state(tf.exp(loss))
-        train_accuracy.update_state(labels, logits)
-        
-        return loss
+    # Load datasets
+    texts = load_conversation_datasets()
     
-    @tf.function
-    def val_step(input_ids, labels):
-        # Forward pass
-        logits = model(input_ids, training=False)
-        
-        # Compute loss
-        loss = loss_fn(labels, logits)
-        
-        # Update metrics
-        val_loss.update_state(loss)
-        val_perplexity.update_state(tf.exp(loss))
-        val_accuracy.update_state(labels, logits)
-        
-        return loss
+    # Check if we have a tokenizer
+    if not hasattr(model, 'tokenizer') or model.tokenizer is None:
+        logger.warning("No tokenizer available, using dummy dataset")
+        train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+        val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+    else:
+        # Create datasets
+        dataset = create_dataset_from_texts(texts, model.tokenizer, config.seq_len, config.batch_size)
+        if dataset is None:
+            logger.warning("Failed to create dataset from texts, using dummy dataset")
+            train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+            val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+        else:
+            # Split into train and validation
+            total_size = sum(1 for _ in dataset)
+            train_size = int(0.9 * total_size)
+            train_dataset = dataset.take(train_size)
+            val_dataset = dataset.skip(train_size)
     
     # Training loop
     num_epochs = 10
@@ -498,8 +408,8 @@ def train_model():
     
     # Save final model
     try:
-        model.save_weights('./checkpoints/minigpt_final.keras')
-        logger.info("Training completed. Model saved to ./checkpoints/minigpt_final.keras")
+        model.save_weights('./checkpoints/minigpt_final.weights.h5')
+        logger.info("Training completed. Model saved to ./checkpoints/minigpt_final.weights.h5")
     except Exception as e:
         logger.error(f"Error saving final model: {e}")
     
