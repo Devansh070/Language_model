@@ -30,6 +30,7 @@ class ModelConfig:
         num_layers: int = 12,
         ffn_dim: int = 3072,
         dropout: float = 0.1,
+        layer_norm_epsilon: float = 1e-5,
         use_custom_attention: bool = True,
         use_rotary_embeddings: bool = True,
         learning_rate: float = 1e-4,
@@ -43,6 +44,7 @@ class ModelConfig:
         self.num_layers = num_layers
         self.ffn_dim = ffn_dim
         self.dropout = dropout
+        self.layer_norm_epsilon = layer_norm_epsilon
         self.use_custom_attention = use_custom_attention
         self.use_rotary_embeddings = use_rotary_embeddings
         self.learning_rate = learning_rate
