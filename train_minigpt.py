@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 import json
 from pathlib import Path
+from minigpt_transformer import EnhancedMiniGPT, ModelConfig
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -172,7 +173,7 @@ def train_model():
     """Main training function"""
     try:
         # Import your model classes here
-        from enhanced_minigpt import EnhancedMiniGPT, ModelConfig
+        # from enhanced_minigpt import EnhancedMiniGPT, ModelConfig
         
         logger.info("Starting MiniGPT training")
         
@@ -320,8 +321,6 @@ def train_model():
 def load_and_test_model(model_path="./checkpoints/minigpt_final.keras"):
     """Load and test a saved model"""
     try:
-        from enhanced_minigpt import EnhancedMiniGPT, ModelConfig
-        
         # Create model with same config
         config = ModelConfig()
         model = EnhancedMiniGPT(config)
