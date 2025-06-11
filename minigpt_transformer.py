@@ -590,7 +590,7 @@ class EnhancedMiniGPT(tf.keras.Model):
             block = TransformerBlock(
                 embed_dim=config.embed_dim,
                 num_heads=config.num_heads,
-                ff_dim=config.ff_dim,
+                ff_dim=config.ffn_dim,
                 dropout_rate=config.dropout,
                 use_custom_attention=True,
                 use_rotary_embeddings=True,
