@@ -21,9 +21,6 @@ from minigpt_transformer import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Import your model (assuming it's in a separate file)
-# from enhanced_minigpt import EnhancedMiniGPT, ModelConfig, MiniGPTTrainer
-
 def create_dummy_dataset(vocab_size=50257, seq_len=512, batch_size=32, num_samples=1000):
     """Create a dummy dataset for testing"""
     def data_generator():
@@ -96,8 +93,12 @@ class CustomModelCheckpoint(tf.keras.callbacks.Callback):
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
         
-        # Format filepath
-        filepath = self.filepath.format(epoch=epoch + 1, **logs)
+        # Format filepath - Fix the formatting issue
+        try:
+            filepath = self.filepath.format(epoch=epoch + 1, **logs)
+        except (KeyError, ValueError) as e:
+            # Fallback to simple epoch-based naming
+            filepath = f"{self.filepath}_epoch_{epoch + 1:02d}"
         
         # Check if we should save
         current = logs.get(self.monitor)
@@ -137,7 +138,7 @@ def setup_callbacks(checkpoint_dir="./checkpoints", monitor='loss'):
     callbacks = [
         # Custom checkpoint callback
         CustomModelCheckpoint(
-            filepath=os.path.join(checkpoint_dir, "minigpt_epoch_{epoch:02d}_loss_{loss:.4f}"),
+            filepath=os.path.join(checkpoint_dir, "minigpt_epoch_{epoch:02d}"),
             save_weights_only=True,
             save_best_only=True,
             monitor=monitor,
@@ -185,10 +186,9 @@ def load_conversation_datasets():
     
     # Define datasets to load
     dataset_configs = [
-        ("conversation", "conversation"),
-        ("daily_dialog", "daily_dialog"),
-        ("conv_ai_2", "conv_ai_2"),
-        ("blended_skill_talk", "blended_skill_talk")
+        ("conv_ai_2", None),  # Use None for default config
+        ("blended_skill_talk", None),
+        ("daily_dialog", None)
     ]
     
     all_texts = []
@@ -196,7 +196,10 @@ def load_conversation_datasets():
     for dataset_name, config_name in dataset_configs:
         try:
             # Load dataset
-            dataset = datasets.load_dataset(dataset_name, config_name, split="train")
+            if config_name:
+                dataset = datasets.load_dataset(dataset_name, config_name, split="train")
+            else:
+                dataset = datasets.load_dataset(dataset_name, split="train")
             logger.info(f"Loaded {dataset_name} dataset")
             
             # Extract conversations
@@ -207,17 +210,21 @@ def load_conversation_datasets():
                     if "dialog" in example:
                         dialog = example["dialog"]
                         if isinstance(dialog, list):
-                            texts.extend(dialog)
+                            texts.extend([str(turn) for turn in dialog])
                     elif "conversation" in example:
                         conv = example["conversation"]
                         if isinstance(conv, list):
-                            texts.extend(conv)
+                            texts.extend([str(turn) for turn in conv])
                     elif "text" in example:
-                        texts.append(example["text"])
+                        texts.append(str(example["text"]))
                     elif "free_messages" in example:
                         messages = example["free_messages"]
                         if isinstance(messages, list):
-                            texts.extend(messages)
+                            texts.extend([str(msg) for msg in messages])
+                    elif "utterances" in example:
+                        utterances = example["utterances"]
+                        if isinstance(utterances, list):
+                            texts.extend([str(utt) for utt in utterances])
             
             all_texts.extend(texts)
             logger.info(f"Added {len(texts)} texts from {dataset_name}")
@@ -234,8 +241,8 @@ def create_dataset_from_texts(texts, tokenizer, seq_len, batch_size):
             logger.warning("No texts provided for dataset creation")
             return None
             
-        # Filter out non-string texts
-        texts = [text for text in texts if isinstance(text, str)]
+        # Filter out non-string texts and empty strings
+        texts = [str(text).strip() for text in texts if text and str(text).strip()]
         if not texts:
             logger.warning("No valid texts after filtering")
             return None
@@ -246,11 +253,11 @@ def create_dataset_from_texts(texts, tokenizer, seq_len, batch_size):
             try:
                 # Tokenize text
                 tokens = tokenizer.encode(text)
-                if not tokens:
+                if not tokens or len(tokens) < 2:  # Need at least 2 tokens
                     continue
                     
-                # Create sequences of length seq_len
-                for i in range(0, len(tokens) - seq_len + 1, seq_len):
+                # Create overlapping sequences of length seq_len
+                for i in range(0, len(tokens) - seq_len + 1, seq_len // 2):
                     sequence = tokens[i:i + seq_len]
                     if len(sequence) == seq_len:  # Only add complete sequences
                         sequences.append(sequence)
@@ -262,6 +269,8 @@ def create_dataset_from_texts(texts, tokenizer, seq_len, batch_size):
             logger.warning("No valid sequences created from texts")
             return None
             
+        logger.info(f"Created {len(sequences)} sequences from {len(texts)} texts")
+        
         # Convert to TensorFlow dataset
         dataset = tf.data.Dataset.from_tensor_slices(sequences)
         dataset = dataset.map(lambda x: {'input_ids': x})
@@ -275,8 +284,14 @@ def create_dataset_from_texts(texts, tokenizer, seq_len, batch_size):
 
 def train_model(model, config):
     """Train the model."""
-    # Create optimizer
-    optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
+    # Create optimizer with gradient clipping
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=config.learning_rate,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-8,
+        clipnorm=1.0  # Add gradient clipping
+    )
     
     # Create metrics
     train_loss = tf.keras.metrics.Mean(name='train_loss')
@@ -287,20 +302,36 @@ def train_model(model, config):
     val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
     
     # Create loss function
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
     
-    # Define training step
+    # Define training step - Fixed shape handling
     @tf.function
-    def train_step(input_ids, labels):
+    def train_step(batch):
+        input_ids = batch['input_ids']
+        
+        # Create input and target sequences
+        inputs = input_ids[:, :-1]  # All tokens except the last one
+        targets = input_ids[:, 1:]  # All tokens except the first one
+        
         with tf.GradientTape() as tape:
             # Forward pass
-            logits = model(input_ids, training=True)
+            logits = model(inputs, training=True)
+            
+            # Compute loss - ensure shapes match
+            batch_size = tf.shape(targets)[0]
+            seq_len = tf.shape(targets)[1]
+            
+            # Flatten targets for loss computation
+            targets_flat = tf.reshape(targets, [-1])
+            logits_flat = tf.reshape(logits, [-1, tf.shape(logits)[-1]])
             
             # Compute loss
-            loss = loss_fn(labels, logits)
+            loss_per_token = loss_fn(targets_flat, logits_flat)
+            loss = tf.reduce_mean(loss_per_token)
             
             # Add regularization losses
-            loss += tf.reduce_sum(model.losses)
+            if model.losses:
+                loss += tf.reduce_sum(model.losses)
         
         # Compute gradients
         gradients = tape.gradient(loss, model.trainable_variables)
@@ -310,24 +341,34 @@ def train_model(model, config):
         
         # Update metrics
         train_loss.update_state(loss)
-        train_perplexity.update_state(tf.exp(loss))
-        train_accuracy.update_state(labels, logits)
+        train_perplexity.update_state(tf.exp(tf.minimum(loss, 10.0)))  # Cap to prevent overflow
+        train_accuracy.update_state(targets, logits)
         
         return loss
     
-    # Define validation step
+    # Define validation step - Fixed shape handling
     @tf.function
-    def val_step(input_ids, labels):
+    def val_step(batch):
+        input_ids = batch['input_ids']
+        
+        # Create input and target sequences
+        inputs = input_ids[:, :-1]
+        targets = input_ids[:, 1:]
+        
         # Forward pass
-        logits = model(input_ids, training=False)
+        logits = model(inputs, training=False)
         
         # Compute loss
-        loss = loss_fn(labels, logits)
+        targets_flat = tf.reshape(targets, [-1])
+        logits_flat = tf.reshape(logits, [-1, tf.shape(logits)[-1]])
+        
+        loss_per_token = loss_fn(targets_flat, logits_flat)
+        loss = tf.reduce_mean(loss_per_token)
         
         # Update metrics
         val_loss.update_state(loss)
-        val_perplexity.update_state(tf.exp(loss))
-        val_accuracy.update_state(labels, logits)
+        val_perplexity.update_state(tf.exp(tf.minimum(loss, 10.0)))
+        val_accuracy.update_state(targets, logits)
         
         return loss
     
@@ -340,33 +381,48 @@ def train_model(model, config):
     # Create summary writers
     train_log_dir = './logs/train'
     val_log_dir = './logs/val'
+    os.makedirs(train_log_dir, exist_ok=True)
+    os.makedirs(val_log_dir, exist_ok=True)
     train_summary_writer = tf.summary.create_file_writer(train_log_dir)
     val_summary_writer = tf.summary.create_file_writer(val_log_dir)
     
     # Load datasets
+    logger.info("Loading conversation datasets...")
     texts = load_conversation_datasets()
     
     # Check if we have a tokenizer
     if not hasattr(model, 'tokenizer') or model.tokenizer is None:
         logger.warning("No tokenizer available, using dummy dataset")
         train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
-        val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+        val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
     else:
         # Create datasets
-        dataset = create_dataset_from_texts(texts, model.tokenizer, config.seq_len, config.batch_size)
-        if dataset is None:
-            logger.warning("Failed to create dataset from texts, using dummy dataset")
-            train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
-            val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+        if texts:
+            dataset = create_dataset_from_texts(texts, model.tokenizer, config.seq_len, config.batch_size)
+            if dataset is None:
+                logger.warning("Failed to create dataset from texts, using dummy dataset")
+                train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+                val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
+            else:
+                # Split into train and validation
+                dataset_list = list(dataset)
+                total_size = len(dataset_list)
+                train_size = int(0.9 * total_size)
+                
+                train_dataset = tf.data.Dataset.from_tensor_slices(dataset_list[:train_size])
+                val_dataset = tf.data.Dataset.from_tensor_slices(dataset_list[train_size:])
+                
+                # Rebatch the datasets
+                train_dataset = train_dataset.unbatch().batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
+                val_dataset = val_dataset.unbatch().batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
         else:
-            # Split into train and validation
-            total_size = sum(1 for _ in dataset)
-            train_size = int(0.9 * total_size)
-            train_dataset = dataset.take(train_size)
-            val_dataset = dataset.skip(train_size)
+            logger.warning("No texts loaded, using dummy dataset")
+            train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+            val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
     
     # Training loop
     num_epochs = 10
+    step_count = 0
     
     for epoch in range(num_epochs):
         logger.info(f"Epoch {epoch + 1}/{num_epochs}")
@@ -381,6 +437,7 @@ def train_model(model, config):
         
         # Training
         try:
+            batch_count = 0
             for batch in train_dataset:
                 if batch is None:
                     continue
@@ -388,15 +445,20 @@ def train_model(model, config):
                 input_ids = batch['input_ids']
                 if input_ids is None or tf.size(input_ids) == 0:
                     continue
-                    
-                labels = input_ids[:, 1:]  # Shift labels by one position
+                
+                # Ensure input has enough tokens
+                if tf.shape(input_ids)[1] < 2:
+                    continue
                 
                 # Train step
-                loss = train_step(input_ids, labels)
+                loss = train_step(batch)
+                step_count += 1
+                batch_count += 1
                 
-                # Log progress
-                if train_accuracy.count % 100 == 0:
-                    logger.info(f"Processed {train_accuracy.count} batches, Loss: {loss:.4f}")
+                # Log progress every 100 batches
+                if batch_count % 100 == 0:
+                    logger.info(f"Epoch {epoch + 1}, Batch {batch_count}, Loss: {float(loss):.4f}")
+                    
         except Exception as e:
             logger.error(f"Error during training: {e}")
             continue
@@ -410,9 +472,12 @@ def train_model(model, config):
                 input_ids = val_batch['input_ids']
                 if input_ids is None or tf.size(input_ids) == 0:
                     continue
-                    
-                labels = input_ids[:, 1:]
-                val_step(input_ids, labels)
+                
+                # Ensure input has enough tokens
+                if tf.shape(input_ids)[1] < 2:
+                    continue
+                
+                val_step(val_batch)
         except Exception as e:
             logger.error(f"Error during validation: {e}")
             continue
@@ -435,26 +500,28 @@ def train_model(model, config):
         try:
             logger.info(
                 f"Epoch {epoch + 1} - "
-                f"Train Loss: {train_loss.result():.4f}, "
-                f"Train Perplexity: {train_perplexity.result():.4f}, "
-                f"Train Accuracy: {train_accuracy.result():.4f}, "
-                f"Val Loss: {val_loss.result():.4f}, "
-                f"Val Perplexity: {val_perplexity.result():.4f}, "
-                f"Val Accuracy: {val_accuracy.result():.4f}"
+                f"Train Loss: {float(train_loss.result()):.4f}, "
+                f"Train Perplexity: {float(train_perplexity.result()):.4f}, "
+                f"Train Accuracy: {float(train_accuracy.result()):.4f}, "
+                f"Val Loss: {float(val_loss.result()):.4f}, "
+                f"Val Perplexity: {float(val_perplexity.result()):.4f}, "
+                f"Val Accuracy: {float(val_accuracy.result()):.4f}"
             )
         except Exception as e:
             logger.error(f"Error printing metrics: {e}")
         
-        # Save checkpoint
+        # Save checkpoint every epoch
         try:
             checkpoint.save(file_prefix=checkpoint_prefix)
+            logger.info(f"Checkpoint saved for epoch {epoch + 1}")
         except Exception as e:
             logger.error(f"Error saving checkpoint: {e}")
     
     # Save final model
     try:
-        model.save_weights('./checkpoints/minigpt_final.weights.h5')
-        logger.info("Training completed. Model saved to ./checkpoints/minigpt_final.weights.h5")
+        final_weights_path = './checkpoints/minigpt_final.weights.h5'
+        model.save_weights(final_weights_path)
+        logger.info(f"Training completed. Model saved to {final_weights_path}")
     except Exception as e:
         logger.error(f"Error saving final model: {e}")
     
@@ -475,7 +542,10 @@ def chat_loop(model):
         
         try:
             # Generate response
-            response = model.chat(user_input)
+            if hasattr(model, 'chat'):
+                response = model.chat(user_input)
+            else:
+                response = "Chat functionality not implemented in model."
             print(f"\nAI: {response}")
         except Exception as e:
             logger.error(f"Error generating response: {e}")
@@ -499,9 +569,16 @@ if __name__ == "__main__":
     )
     
     # Create model
+    logger.info("Creating model...")
     model = EnhancedMiniGPT(config)
     
+    # Build model by calling it with dummy input
+    dummy_input = tf.random.uniform((1, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
+    _ = model(dummy_input)
+    logger.info(f"Model created successfully with {model.count_params():,} parameters")
+    
     # Train model
+    logger.info("Starting training...")
     model = train_model(model, config)
     
     # Start chat loop
