@@ -437,18 +437,27 @@ def chat_loop(model):
             print("\nAI: I apologize, but I encountered an error. Please try again.")
 
 if __name__ == "__main__":
-    # Set memory growth for GPU
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            logger.info(f"Found {len(gpus)} GPU(s)")
-        except RuntimeError as e:
-            logger.warning(f"GPU setup failed: {e}")
+    # Create model configuration
+    config = ModelConfig(
+        vocab_size=50257,  # GPT-2 vocabulary size
+        max_seq_len=1024,
+        embed_dim=768,
+        num_heads=12,
+        num_layers=12,
+        ffn_dim=3072,
+        dropout=0.1,
+        use_custom_attention=True,
+        use_rotary_embeddings=True,
+        learning_rate=1e-4,
+        batch_size=32,
+        seq_len=1024
+    )
+    
+    # Create model
+    model = EnhancedMiniGPT(config)
     
     # Train model
-    model = train_model()
+    model = train_model(model, config)
     
     # Start chat loop
     chat_loop(model)
