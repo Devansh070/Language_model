@@ -5,6 +5,8 @@ import logging
 from datetime import datetime
 import json
 from pathlib import Path
+import datasets
+from datasets import disable_caching
 from minigpt_transformer import (
     EnhancedMiniGPT,
     ModelConfig,
@@ -177,6 +179,95 @@ def setup_callbacks(checkpoint_dir="./checkpoints", monitor='loss'):
     
     return callbacks
 
+def load_conversation_datasets():
+    """Load conversation datasets from HuggingFace."""
+    disable_caching()
+    
+    # Define datasets to load
+    dataset_configs = [
+        ("conversation", "conversation"),
+        ("daily_dialog", "daily_dialog"),
+        ("conv_ai_2", "conv_ai_2"),
+        ("blended_skill_talk", "blended_skill_talk")
+    ]
+    
+    all_texts = []
+    
+    for dataset_name, config_name in dataset_configs:
+        try:
+            # Load dataset
+            dataset = datasets.load_dataset(dataset_name, config_name, split="train")
+            logger.info(f"Loaded {dataset_name} dataset")
+            
+            # Extract conversations
+            texts = []
+            for example in dataset:
+                if isinstance(example, dict):
+                    # Handle different dataset formats
+                    if "dialog" in example:
+                        dialog = example["dialog"]
+                        if isinstance(dialog, list):
+                            texts.extend(dialog)
+                    elif "conversation" in example:
+                        conv = example["conversation"]
+                        if isinstance(conv, list):
+                            texts.extend(conv)
+                    elif "text" in example:
+                        texts.append(example["text"])
+                    elif "free_messages" in example:
+                        messages = example["free_messages"]
+                        if isinstance(messages, list):
+                            texts.extend(messages)
+            
+            all_texts.extend(texts)
+            logger.info(f"Added {len(texts)} texts from {dataset_name}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to load {dataset_name}: {e}")
+    
+    return all_texts
+
+def create_dataset_from_texts(texts, tokenizer, seq_len=512, batch_size=32):
+    """Create dataset from list of texts."""
+    try:
+        sequences = []
+        
+        for text in texts:
+            if not isinstance(text, str):
+                continue
+                
+            # Tokenize text
+            try:
+                tokens = tokenizer.encode(text)
+            except Exception as e:
+                logger.warning(f"Failed to tokenize text: {e}")
+                continue
+            
+            # Create sequences with overlap
+            for i in range(0, len(tokens) - seq_len, seq_len // 2):
+                sequences.append(tokens[i:i + seq_len])
+        
+        if not sequences:
+            logger.warning("No valid sequences created from texts")
+            return None
+        
+        def data_generator():
+            for seq in sequences:
+                yield {'input_ids': np.array(seq, dtype=np.int32)}
+        
+        dataset = tf.data.Dataset.from_generator(
+            data_generator,
+            output_signature={
+                'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
+            }
+        )
+        
+        return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        
+    except Exception as e:
+        logger.error(f"Failed to create dataset: {e}")
+        return None
+
 def train_model():
     """Train the MiniGPT model."""
     # Create model configuration
@@ -194,6 +285,57 @@ def train_model():
     
     # Create model
     model = EnhancedMiniGPT(config)
+    
+    # Check if tokenizer is available
+    if model.tokenizer is None:
+        logger.warning("No tokenizer available. Using dummy dataset for testing.")
+        train_dataset = create_dummy_dataset(
+            vocab_size=config.vocab_size,
+            seq_len=config.max_seq_len,
+            batch_size=32
+        )
+        val_dataset = create_dummy_dataset(
+            vocab_size=config.vocab_size,
+            seq_len=config.max_seq_len,
+            batch_size=32,
+            num_samples=200
+        )
+    else:
+        # Load datasets
+        texts = load_conversation_datasets()
+        
+        if not texts:
+            logger.warning("No texts loaded from datasets. Using dummy dataset for testing.")
+            train_dataset = create_dummy_dataset(
+                vocab_size=config.vocab_size,
+                seq_len=config.max_seq_len,
+                batch_size=32
+            )
+            val_dataset = create_dummy_dataset(
+                vocab_size=config.vocab_size,
+                seq_len=config.max_seq_len,
+                batch_size=32,
+                num_samples=200
+            )
+        else:
+            # Split into train and validation
+            split_idx = int(len(texts) * 0.9)  # 90% train, 10% validation
+            train_texts = texts[:split_idx]
+            val_texts = texts[split_idx:]
+            
+            # Create datasets
+            train_dataset = create_dataset_from_texts(
+                train_texts,
+                model.tokenizer,
+                seq_len=config.max_seq_len,
+                batch_size=32
+            )
+            val_dataset = create_dataset_from_texts(
+                val_texts,
+                model.tokenizer,
+                seq_len=config.max_seq_len,
+                batch_size=32
+            )
     
     # Create optimizer with learning rate schedule
     optimizer = tf.keras.optimizers.Adam(
@@ -270,67 +412,96 @@ def train_model():
     
     # Training loop
     num_epochs = 10
-    steps_per_epoch = 1000  # Adjust based on your dataset size
     
     for epoch in range(num_epochs):
         logger.info(f"Epoch {epoch + 1}/{num_epochs}")
         
         # Reset metrics
-        train_loss.reset_states()
-        train_perplexity.reset_states()
-        train_accuracy.reset_states()
-        val_loss.reset_states()
-        val_perplexity.reset_states()
-        val_accuracy.reset_states()
+        train_loss.reset_state()
+        train_perplexity.reset_state()
+        train_accuracy.reset_state()
+        val_loss.reset_state()
+        val_perplexity.reset_state()
+        val_accuracy.reset_state()
         
         # Training
-        for step in range(steps_per_epoch):
-            # Get batch
-            batch = next(iter(train_dataset))
-            input_ids = batch['input_ids']
-            labels = input_ids[:, 1:]  # Shift labels by one position
-            
-            # Train step
-            loss = train_step(input_ids, labels)
-            
-            # Log progress
-            if step % 100 == 0:
-                logger.info(f"Step {step}/{steps_per_epoch}, Loss: {loss:.4f}")
+        try:
+            for batch in train_dataset:
+                if batch is None:
+                    continue
+                    
+                input_ids = batch['input_ids']
+                if input_ids is None or tf.size(input_ids) == 0:
+                    continue
+                    
+                labels = input_ids[:, 1:]  # Shift labels by one position
+                
+                # Train step
+                loss = train_step(input_ids, labels)
+                
+                # Log progress
+                if train_accuracy.count % 100 == 0:
+                    logger.info(f"Processed {train_accuracy.count} batches, Loss: {loss:.4f}")
+        except Exception as e:
+            logger.error(f"Error during training: {e}")
+            continue
         
         # Validation
-        for val_batch in val_dataset:
-            input_ids = val_batch['input_ids']
-            labels = input_ids[:, 1:]
-            val_step(input_ids, labels)
+        try:
+            for val_batch in val_dataset:
+                if val_batch is None:
+                    continue
+                    
+                input_ids = val_batch['input_ids']
+                if input_ids is None or tf.size(input_ids) == 0:
+                    continue
+                    
+                labels = input_ids[:, 1:]
+                val_step(input_ids, labels)
+        except Exception as e:
+            logger.error(f"Error during validation: {e}")
+            continue
         
         # Log metrics
-        with train_summary_writer.as_default():
-            tf.summary.scalar('loss', train_loss.result(), step=epoch)
-            tf.summary.scalar('perplexity', train_perplexity.result(), step=epoch)
-            tf.summary.scalar('accuracy', train_accuracy.result(), step=epoch)
-        
-        with val_summary_writer.as_default():
-            tf.summary.scalar('loss', val_loss.result(), step=epoch)
-            tf.summary.scalar('perplexity', val_perplexity.result(), step=epoch)
-            tf.summary.scalar('accuracy', val_accuracy.result(), step=epoch)
+        try:
+            with train_summary_writer.as_default():
+                tf.summary.scalar('loss', train_loss.result(), step=epoch)
+                tf.summary.scalar('perplexity', train_perplexity.result(), step=epoch)
+                tf.summary.scalar('accuracy', train_accuracy.result(), step=epoch)
+            
+            with val_summary_writer.as_default():
+                tf.summary.scalar('loss', val_loss.result(), step=epoch)
+                tf.summary.scalar('perplexity', val_perplexity.result(), step=epoch)
+                tf.summary.scalar('accuracy', val_accuracy.result(), step=epoch)
+        except Exception as e:
+            logger.error(f"Error logging metrics: {e}")
         
         # Print metrics
-        logger.info(
-            f"Epoch {epoch + 1} - "
-            f"Train Loss: {train_loss.result():.4f}, "
-            f"Train Perplexity: {train_perplexity.result():.4f}, "
-            f"Train Accuracy: {train_accuracy.result():.4f}, "
-            f"Val Loss: {val_loss.result():.4f}, "
-            f"Val Perplexity: {val_perplexity.result():.4f}, "
-            f"Val Accuracy: {val_accuracy.result():.4f}"
-        )
+        try:
+            logger.info(
+                f"Epoch {epoch + 1} - "
+                f"Train Loss: {train_loss.result():.4f}, "
+                f"Train Perplexity: {train_perplexity.result():.4f}, "
+                f"Train Accuracy: {train_accuracy.result():.4f}, "
+                f"Val Loss: {val_loss.result():.4f}, "
+                f"Val Perplexity: {val_perplexity.result():.4f}, "
+                f"Val Accuracy: {val_accuracy.result():.4f}"
+            )
+        except Exception as e:
+            logger.error(f"Error printing metrics: {e}")
         
         # Save checkpoint
-        checkpoint.save(file_prefix=checkpoint_prefix)
+        try:
+            checkpoint.save(file_prefix=checkpoint_prefix)
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
     
     # Save final model
-    model.save_weights('./checkpoints/minigpt_final.keras')
-    logger.info("Training completed. Model saved to ./checkpoints/minigpt_final.keras")
+    try:
+        model.save_weights('./checkpoints/minigpt_final.keras')
+        logger.info("Training completed. Model saved to ./checkpoints/minigpt_final.keras")
+    except Exception as e:
+        logger.error(f"Error saving final model: {e}")
     
     return model
 
