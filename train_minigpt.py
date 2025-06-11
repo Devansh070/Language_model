@@ -286,6 +286,51 @@ def train_model(model, config):
     val_perplexity = tf.keras.metrics.Mean(name='val_perplexity')
     val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
     
+    # Create loss function
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    
+    # Define training step
+    @tf.function
+    def train_step(input_ids, labels):
+        with tf.GradientTape() as tape:
+            # Forward pass
+            logits = model(input_ids, training=True)
+            
+            # Compute loss
+            loss = loss_fn(labels, logits)
+            
+            # Add regularization losses
+            loss += tf.reduce_sum(model.losses)
+        
+        # Compute gradients
+        gradients = tape.gradient(loss, model.trainable_variables)
+        
+        # Apply gradients
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        
+        # Update metrics
+        train_loss.update_state(loss)
+        train_perplexity.update_state(tf.exp(loss))
+        train_accuracy.update_state(labels, logits)
+        
+        return loss
+    
+    # Define validation step
+    @tf.function
+    def val_step(input_ids, labels):
+        # Forward pass
+        logits = model(input_ids, training=False)
+        
+        # Compute loss
+        loss = loss_fn(labels, logits)
+        
+        # Update metrics
+        val_loss.update_state(loss)
+        val_perplexity.update_state(tf.exp(loss))
+        val_accuracy.update_state(labels, logits)
+        
+        return loss
+    
     # Create checkpoint
     checkpoint_dir = './checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
