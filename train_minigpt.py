@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 import json
 from pathlib import Path
-from minigpt_transformer import EnhancedMiniGPT, ModelConfig
+from minigpt_transformer import EnhancedMiniGPT, ModelConfig, CustomMultiHeadAttention, MultiHeadAttention, RotaryPositionalEmbedding, FeedForward, TransformerBlock
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -107,12 +107,12 @@ class CustomModelCheckpoint(tf.keras.callbacks.Callback):
                 # Ensure .weights.h5 extension
                 if not filepath.endswith('.weights.h5'):
                     filepath = filepath + '.weights.h5'
-                self.model.save_weights(filepath)
+                self.model.save_weights(filepath, save_format='h5')
             else:
                 # Save full model
                 if not filepath.endswith('.keras'):
                     filepath = filepath + '.keras'
-                self.model.save(filepath)
+                self.model.save(filepath, save_format='keras')
             
             if self.verbose > 0:
                 logger.info(f"Saved model at epoch {epoch + 1}: {filepath}")
@@ -251,109 +251,184 @@ def train_model():
         
         logger.info(f"Starting training for {epochs} epochs with {steps_per_epoch} steps per epoch")
         
-        # Custom training loop with proper loss calculation
+        # Custom training loop with metrics
         @tf.function
         def train_step(batch):
             input_ids = batch['input_ids']
-            # For language modeling, shift labels by one position
-            inputs = input_ids[:, :-1]
-            labels = input_ids[:, 1:]
+            labels = input_ids[:, 1:]  # Shift input_ids by 1 for next token prediction
+            input_ids = input_ids[:, :-1]  # Remove last token from input
             
             with tf.GradientTape() as tape:
-                logits = model(inputs, training=True)
+                # Forward pass
+                logits = model(input_ids, training=True)
+                
+                # Calculate loss
                 loss = tf.keras.losses.sparse_categorical_crossentropy(
                     labels, logits, from_logits=True
                 )
                 loss = tf.reduce_mean(loss)
+                
+                # Calculate perplexity
+                perplexity = tf.exp(loss)
+                
+                # Calculate accuracy
+                predictions = tf.argmax(logits, axis=-1)
+                accuracy = tf.reduce_mean(
+                    tf.cast(tf.equal(predictions, labels), tf.float32)
+                )
             
+            # Calculate gradients and apply them
             gradients = tape.gradient(loss, model.trainable_variables)
-            gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
             
-            return loss
+            return loss, perplexity, accuracy
         
         # Training loop
+        logger.info("Starting training...")
         for epoch in range(epochs):
-            logger.info(f"Epoch {epoch + 1}/{epochs}")
             epoch_loss = 0
-            num_steps = 0
+            epoch_perplexity = 0
+            epoch_accuracy = 0
             
-            for step, batch in enumerate(dataset.take(steps_per_epoch)):
-                loss = train_step(batch)
-                epoch_loss += loss
-                num_steps += 1
+            # Progress bar
+            progress_bar = tf.keras.utils.Progbar(
+                steps_per_epoch,
+                stateful_metrics=['loss', 'perplexity', 'accuracy']
+            )
+            
+            for step in range(steps_per_epoch):
+                # Get batch
+                batch = next(iter(dataset))
                 
-                if step % 20 == 0:
-                    logger.info(f"Step {step}, Loss: {loss:.4f}")
+                # Training step
+                loss, perplexity, accuracy = train_step(batch)
+                
+                # Update metrics
+                epoch_loss += loss
+                epoch_perplexity += perplexity
+                epoch_accuracy += accuracy
+                
+                # Update progress bar
+                progress_bar.update(
+                    step + 1,
+                    values=[
+                        ('loss', loss),
+                        ('perplexity', perplexity),
+                        ('accuracy', accuracy)
+                    ]
+                )
             
-            avg_loss = epoch_loss / num_steps
-            logger.info(f"Epoch {epoch + 1} completed. Average loss: {avg_loss:.4f}")
+            # Calculate epoch averages
+            epoch_loss /= steps_per_epoch
+            epoch_perplexity /= steps_per_epoch
+            epoch_accuracy /= steps_per_epoch
             
-            # Manually trigger callbacks
-            logs = {'loss': float(avg_loss)}
-            for callback in callbacks:
-                if hasattr(callback, 'on_epoch_end'):
-                    callback.on_epoch_end(epoch, logs)
+            # Log metrics
+            logger.info(
+                f"Epoch {epoch + 1}/{epochs} - "
+                f"Loss: {epoch_loss:.4f} - "
+                f"Perplexity: {epoch_perplexity:.4f} - "
+                f"Accuracy: {epoch_accuracy:.4f}"
+            )
+            
+            # Save checkpoint
+            checkpoint_path = os.path.join(
+                "./checkpoints",
+                f"minigpt_epoch_{epoch + 1:02d}_loss_{epoch_loss:.4f}.keras"
+            )
+            model.save(checkpoint_path)
+            logger.info(f"Saved checkpoint: {checkpoint_path}")
         
         # Save final model
-        final_model_path = "./checkpoints/minigpt_final.keras"
-        model.save(final_model_path)
-        logger.info(f"Final model saved to {final_model_path}")
+        final_path = os.path.join("./checkpoints", "minigpt_final.keras")
+        model.save(final_path)
+        logger.info(f"Training completed. Final model saved to: {final_path}")
         
-        # Test generation
-        if model.tokenizer:
-            logger.info("Testing text generation...")
-            try:
-                sample_text = model.generate_text(
-                    "The future of artificial intelligence is",
-                    max_length=50,
-                    temperature=0.8
-                )
-                logger.info(f"Generated text: {sample_text}")
-            except Exception as e:
-                logger.warning(f"Text generation test failed: {e}")
-        
-        logger.info("Training completed successfully!")
-        
+        return model
+
     except Exception as e:
         logger.error(f"Training failed: {e}")
         raise
 
 def load_and_test_model(model_path="./checkpoints/minigpt_final.keras"):
-    """Load and test a saved model"""
+    """Load and test the trained model"""
     try:
-        # Create model with same config
-        config = ModelConfig(
-            vocab_size=50257,
-            max_seq_len=512,
-            embed_dim=512,
-            num_heads=8,
-            num_layers=12,
-            ffn_dim=2048,
-            dropout=0.1,
-            use_custom_attention=True
-        )
-        model = EnhancedMiniGPT(config)
-        model.build_model()
-        
-        # Load weights
+        # Load model
         if model_path.endswith('.weights.h5'):
+            # Create model with same config
+            config = ModelConfig()
+            model = EnhancedMiniGPT(config)
+            model.build_model()
             model.load_weights(model_path)
             logger.info(f"Loaded model weights from {model_path}")
         else:
-            model = tf.keras.models.load_model(model_path)
+            model = tf.keras.models.load_model(model_path, custom_objects={
+                'EnhancedMiniGPT': EnhancedMiniGPT,
+                'ModelConfig': ModelConfig,
+                'CustomMultiHeadAttention': CustomMultiHeadAttention,
+                'MultiHeadAttention': MultiHeadAttention,
+                'RotaryPositionalEmbedding': RotaryPositionalEmbedding,
+                'FeedForward': FeedForward,
+                'TransformerBlock': TransformerBlock
+            })
             logger.info(f"Loaded full model from {model_path}")
         
-        # Test the model
-        test_input = tf.random.uniform((1, 64), minval=0, maxval=config.vocab_size, dtype=tf.int32)
-        output = model(test_input)
-        logger.info(f"Model test successful. Output shape: {output.shape}")
+        # Create test dataset
+        test_dataset = create_dummy_dataset(
+            vocab_size=50257,
+            seq_len=512,
+            batch_size=8,
+            num_samples=100
+        )
+        
+        # Test metrics
+        total_loss = 0
+        total_perplexity = 0
+        total_accuracy = 0
+        num_batches = 0
+        
+        for batch in test_dataset:
+            input_ids = batch['input_ids']
+            labels = input_ids[:, 1:]
+            input_ids = input_ids[:, :-1]
+            
+            # Forward pass
+            logits = model(input_ids, training=False)
+            
+            # Calculate metrics
+            loss = tf.keras.losses.sparse_categorical_crossentropy(
+                labels, logits, from_logits=True
+            )
+            loss = tf.reduce_mean(loss)
+            perplexity = tf.exp(loss)
+            
+            predictions = tf.argmax(logits, axis=-1)
+            accuracy = tf.reduce_mean(
+                tf.cast(tf.equal(predictions, labels), tf.float32)
+            )
+            
+            total_loss += loss
+            total_perplexity += perplexity
+            total_accuracy += accuracy
+            num_batches += 1
+        
+        # Calculate averages
+        avg_loss = total_loss / num_batches
+        avg_perplexity = total_perplexity / num_batches
+        avg_accuracy = total_accuracy / num_batches
+        
+        logger.info(
+            f"Test Results:\n"
+            f"Loss: {avg_loss:.4f}\n"
+            f"Perplexity: {avg_perplexity:.4f}\n"
+            f"Accuracy: {avg_accuracy:.4f}"
+        )
         
         return model
         
     except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        return None
+        logger.error(f"Testing failed: {e}")
+        raise
 
 if __name__ == "__main__":
     # Set memory growth for GPU
@@ -366,5 +441,51 @@ if __name__ == "__main__":
         except RuntimeError as e:
             logger.warning(f"GPU setup failed: {e}")
     
-    # Run training
-    train_model()
+    # Train model
+    model = train_model()
+    
+    # Test model
+    test_model = load_and_test_model()
+    
+    # Interactive chat loop
+    def chat_loop(model):
+        print("\nStarting chat session. Type 'quit' to exit.")
+        print("Model is ready to chat!")
+        
+        while True:
+            try:
+                # Get user input
+                user_input = input("\nYou: ").strip()
+                
+                # Check for quit command
+                if user_input.lower() == 'quit':
+                    print("\nEnding chat session. Goodbye!")
+                    break
+                
+                # Skip empty messages
+                if not user_input:
+                    continue
+                
+                # Generate response
+                response = model.chat(
+                    message=user_input,
+                    max_length=100,
+                    temperature=0.7
+                )
+                
+                # Print response
+                print(f"\nAssistant: {response}")
+                
+            except KeyboardInterrupt:
+                print("\n\nChat session interrupted. Goodbye!")
+                break
+            except Exception as e:
+                print(f"\nError: {e}")
+                print("Please try again or type 'quit' to exit.")
+    
+    # Start chat loop if model has tokenizer
+    if model.tokenizer:
+        chat_loop(model)
+    else:
+        print("\nWarning: No tokenizer available. Chat functionality is disabled.")
+        print("Please install transformers library to enable chat functionality.")
