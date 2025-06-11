@@ -109,227 +109,103 @@ class RotaryPositionalEmbedding(layers.Layer):
         })
         return config
 
-class CustomMultiHeadAttention(layers.Layer):
-    """
-    Custom implementation of Multi-Head Attention mechanism from scratch.
-    Supports causal masking and padding masking.
-    """
+class CustomMultiHeadAttention(tf.keras.layers.Layer):
+    """Custom multi-head attention layer with optional rotary embeddings."""
     
-    def __init__(self, num_heads, key_dim, value_dim=None, dropout=0.0, use_bias=True, 
-                 output_shape=None, attention_axes=None, kernel_initializer="glorot_uniform",
-                 bias_initializer="zeros", kernel_regularizer=None, bias_regularizer=None,
-                 activity_regularizer=None, kernel_constraint=None, bias_constraint=None,
-                 **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        num_heads: int,
+        key_dim: int,
+        use_rotary_embeddings: bool = True,
+        dropout: float = 0.1,
+        name: str = None,
+        **kwargs
+    ):
+        # Remove custom arguments from kwargs before passing to parent
+        custom_kwargs = {
+            'use_rotary_embeddings': use_rotary_embeddings
+        }
+        for key in custom_kwargs:
+            kwargs.pop(key, None)
+            
+        super().__init__(name=name, **kwargs)
         
         self.num_heads = num_heads
         self.key_dim = key_dim
-        self.value_dim = value_dim if value_dim is not None else key_dim
+        self.use_rotary_embeddings = use_rotary_embeddings
         self.dropout = dropout
-        self.use_bias = use_bias
-        self.output_shape = output_shape
-        self.attention_axes = attention_axes
-        self.kernel_initializer = kernel_initializer
-        self.bias_initializer = bias_initializer
-        self.kernel_regularizer = kernel_regularizer
-        self.bias_regularizer = bias_regularizer
-        self.activity_regularizer = activity_regularizer
-        self.kernel_constraint = kernel_constraint
-        self.bias_constraint = bias_constraint
+        
+        # Create query, key, value projection layers
+        self.query_dense = tf.keras.layers.Dense(num_heads * key_dim)
+        self.key_dense = tf.keras.layers.Dense(num_heads * key_dim)
+        self.value_dense = tf.keras.layers.Dense(num_heads * key_dim)
+        
+        # Create output projection layer
+        self.output_dense = tf.keras.layers.Dense(num_heads * key_dim)
+        
+        # Create dropout layer
+        self.dropout_layer = tf.keras.layers.Dropout(dropout)
+        
+        # Create rotary embeddings if enabled
+        if use_rotary_embeddings:
+            self.rotary_embeddings = RotaryPositionalEmbedding(key_dim)
     
-    def build(self, input_shape):
-        # Get input dimensions
-        if isinstance(input_shape, list):
-            query_shape = input_shape[0]
-        else:
-            query_shape = input_shape
+    def call(self, inputs, attention_mask=None, training=False):
+        # Get input shape
+        batch_size = tf.shape(inputs)[0]
+        seq_len = tf.shape(inputs)[1]
         
-        # Get embedding dimension
-        self.embed_dim = query_shape[-1]
-        
-        # Validate embedding dimension
-        if self.embed_dim % self.num_heads != 0:
-            raise ValueError(
-                f"embedding dimension {self.embed_dim} must be divisible by number of heads {self.num_heads}"
-            )
-        
-        # Calculate dimensions for each head
-        self.head_dim = self.embed_dim // self.num_heads
-        
-        # Create projection matrices for Q, K, V
-        self.query_dense = layers.Dense(
-            self.embed_dim,
-            use_bias=self.use_bias,
-            kernel_initializer=self.kernel_initializer,
-            bias_initializer=self.bias_initializer,
-            kernel_regularizer=self.kernel_regularizer,
-            bias_regularizer=self.bias_regularizer,
-            kernel_constraint=self.kernel_constraint,
-            bias_constraint=self.bias_constraint,
-            name="query"
-        )
-        
-        self.key_dense = layers.Dense(
-            self.embed_dim,
-            use_bias=self.use_bias,
-            kernel_initializer=self.kernel_initializer,
-            bias_initializer=self.bias_initializer,
-            kernel_regularizer=self.kernel_regularizer,
-            bias_regularizer=self.bias_regularizer,
-            kernel_constraint=self.kernel_constraint,
-            bias_constraint=self.bias_constraint,
-            name="key"
-        )
-        
-        self.value_dense = layers.Dense(
-            self.embed_dim,
-            use_bias=self.use_bias,
-            kernel_initializer=self.kernel_initializer,
-            bias_initializer=self.bias_initializer,
-            kernel_regularizer=self.kernel_regularizer,
-            bias_regularizer=self.bias_regularizer,
-            kernel_constraint=self.kernel_constraint,
-            bias_constraint=self.bias_constraint,
-            name="value"
-        )
-        
-        # Output projection
-        self.output_dense = layers.Dense(
-            self.embed_dim,
-            use_bias=self.use_bias,
-            kernel_initializer=self.kernel_initializer,
-            bias_initializer=self.bias_initializer,
-            kernel_regularizer=self.kernel_regularizer,
-            bias_regularizer=self.bias_regularizer,
-            kernel_constraint=self.kernel_constraint,
-            bias_constraint=self.bias_constraint,
-            name="output"
-        )
-        
-        # Dropout layer
-        self.dropout_layer = layers.Dropout(self.dropout)
-        
-        super().build(input_shape)
-    
-    def call(self, inputs, mask=None, use_causal_mask=False, training=None):
-        """
-        Compute multi-head attention.
-        
-        Args:
-            inputs: Query tensor of shape [batch_size, seq_len, embed_dim]
-                   or list of [query, key, value] tensors
-            mask: Padding mask of shape [batch_size, seq_len] or [batch_size, seq_len, seq_len]
-            use_causal_mask: Whether to use causal masking
-            training: Whether the layer is in training mode
-        
-        Returns:
-            Output tensor of shape [batch_size, seq_len, embed_dim]
-        """
-        # Handle different input formats
-        if isinstance(inputs, list):
-            query, key, value = inputs
-        else:
-            query = key = value = inputs
-        
-        # Get shapes
-        batch_size = tf.shape(query)[0]
-        query_len = tf.shape(query)[1]
-        key_len = tf.shape(key)[1]
-        
-        # Project inputs to Q, K, V
-        query = self.query_dense(query)  # [batch_size, query_len, embed_dim]
-        key = self.key_dense(key)        # [batch_size, key_len, embed_dim]
-        value = self.value_dense(value)  # [batch_size, key_len, embed_dim]
+        # Project inputs to query, key, value
+        q = self.query_dense(inputs)  # [batch_size, seq_len, num_heads * key_dim]
+        k = self.key_dense(inputs)    # [batch_size, seq_len, num_heads * key_dim]
+        v = self.value_dense(inputs)  # [batch_size, seq_len, num_heads * key_dim]
         
         # Reshape for multi-head attention
-        query = tf.reshape(query, [batch_size, query_len, self.num_heads, self.head_dim])
-        key = tf.reshape(key, [batch_size, key_len, self.num_heads, self.head_dim])
-        value = tf.reshape(value, [batch_size, key_len, self.num_heads, self.head_dim])
+        q = tf.reshape(q, [batch_size, seq_len, self.num_heads, self.key_dim])
+        k = tf.reshape(k, [batch_size, seq_len, self.num_heads, self.key_dim])
+        v = tf.reshape(v, [batch_size, seq_len, self.num_heads, self.key_dim])
+        
+        # Apply rotary embeddings if enabled
+        if self.use_rotary_embeddings:
+            q = self.rotary_embeddings(q)
+            k = self.rotary_embeddings(k)
         
         # Transpose for attention computation
-        query = tf.transpose(query, [0, 2, 1, 3])  # [batch_size, num_heads, query_len, head_dim]
-        key = tf.transpose(key, [0, 2, 1, 3])      # [batch_size, num_heads, key_len, head_dim]
-        value = tf.transpose(value, [0, 2, 1, 3])  # [batch_size, num_heads, key_len, head_dim]
+        q = tf.transpose(q, [0, 2, 1, 3])  # [batch_size, num_heads, seq_len, key_dim]
+        k = tf.transpose(k, [0, 2, 1, 3])  # [batch_size, num_heads, seq_len, key_dim]
+        v = tf.transpose(v, [0, 2, 1, 3])  # [batch_size, num_heads, seq_len, key_dim]
         
         # Compute attention scores
-        scores = tf.matmul(query, key, transpose_b=True)  # [batch_size, num_heads, query_len, key_len]
+        scores = tf.matmul(q, k, transpose_b=True)  # [batch_size, num_heads, seq_len, seq_len]
+        scores = scores / tf.math.sqrt(tf.cast(self.key_dim, scores.dtype))
         
-        # Scale scores
-        scores = scores / tf.sqrt(tf.cast(self.head_dim, scores.dtype))
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            scores = scores + attention_mask
         
-        # Apply causal mask if requested
-        if use_causal_mask:
-            # Create causal mask
-            causal_mask = tf.linalg.band_part(
-                tf.ones((query_len, key_len)), -1, 0
-            )
-            causal_mask = tf.cast(causal_mask, scores.dtype)
-            causal_mask = tf.expand_dims(tf.expand_dims(causal_mask, 0), 0)
-            
-            # Apply causal mask
-            scores = scores * causal_mask + (1.0 - causal_mask) * -1e9
-        
-        # Apply masks
-        if mask is not None:
-            # Handle different mask shapes
-            if len(mask.shape) == 2:
-                # Padding mask: [batch_size, seq_len]
-                mask = tf.expand_dims(tf.expand_dims(mask, 1), 1)
-                # Convert to attention mask
-                attention_mask = (1.0 - tf.cast(mask, scores.dtype)) * -1e9
-                scores = scores + attention_mask
-            elif len(mask.shape) == 4:
-                # Pre-computed attention mask: [batch_size, num_heads, query_len, key_len]
-                # or [1, 1, query_len, key_len] for broadcasting
-                scores = scores + mask
-            else:
-                # 3D mask: [batch_size, query_len, key_len]
-                mask = tf.expand_dims(mask, 1)  # Add head dimension
-                scores = scores + mask
-        
-        # Compute attention weights
+        # Apply softmax to get attention weights
         attention_weights = tf.nn.softmax(scores, axis=-1)
-        
-        # Apply dropout to attention weights
         attention_weights = self.dropout_layer(attention_weights, training=training)
         
-        # Compute attention output
-        attention_output = tf.matmul(attention_weights, value)  # [batch_size, num_heads, query_len, head_dim]
+        # Apply attention weights to values
+        context = tf.matmul(attention_weights, v)  # [batch_size, num_heads, seq_len, key_dim]
         
-        # Transpose and reshape
-        attention_output = tf.transpose(attention_output, [0, 2, 1, 3])  # [batch_size, query_len, num_heads, head_dim]
-        attention_output = tf.reshape(attention_output, [batch_size, query_len, self.embed_dim])
+        # Transpose and reshape for output
+        context = tf.transpose(context, [0, 2, 1, 3])  # [batch_size, seq_len, num_heads, key_dim]
+        context = tf.reshape(context, [batch_size, seq_len, self.num_heads * self.key_dim])
         
-        # Final projection
-        output = self.output_dense(attention_output)
+        # Project to output
+        output = self.output_dense(context)
         
         return output
-    
-    def compute_output_shape(self, input_shape):
-        if isinstance(input_shape, list):
-            query_shape = input_shape[0]
-        else:
-            query_shape = input_shape
-        
-        return tf.TensorShape([*query_shape[:-1], self.embed_dim])
     
     def get_config(self):
         config = super().get_config()
         config.update({
-            "num_heads": self.num_heads,
-            "key_dim": self.key_dim,
-            "value_dim": self.value_dim,
-            "dropout": self.dropout,
-            "use_bias": self.use_bias,
-            "output_shape": self.output_shape,
-            "attention_axes": self.attention_axes,
-            "kernel_initializer": self.kernel_initializer,
-            "bias_initializer": self.bias_initializer,
-            "kernel_regularizer": self.kernel_regularizer,
-            "bias_regularizer": self.bias_regularizer,
-            "activity_regularizer": self.activity_regularizer,
-            "kernel_constraint": self.kernel_constraint,
-            "bias_constraint": self.bias_constraint,
+            'num_heads': self.num_heads,
+            'key_dim': self.key_dim,
+            'use_rotary_embeddings': self.use_rotary_embeddings,
+            'dropout': self.dropout
         })
         return config
 
