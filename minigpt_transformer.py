@@ -52,70 +52,61 @@ class ModelConfig:
         self.seq_len = seq_len
 
 class RotaryPositionalEmbedding(layers.Layer):
-    """Rotary Positional Embedding (RoPE)"""
-    
-    def __init__(self, dim, max_seq_len=2048, base=10000.0, **kwargs):
+    """Rotary Positional Embedding layer."""
+    def __init__(self, dim, max_seq_len=1024, **kwargs):
         super().__init__(**kwargs)
         self.dim = dim
         self.max_seq_len = max_seq_len
-        self.base = base
-        
-    def build(self, input_shape):
-        # Pre-compute frequency components
-        inv_freq = 1.0 / (self.base ** (tf.range(0, self.dim, 2, dtype=tf.float32) / self.dim))
-        self.inv_freq = self.add_weight(
-            name="inv_freq",
-            shape=inv_freq.shape,
-            initializer='zeros',
-            trainable=False
-        )
-        self.inv_freq.assign(inv_freq)
-        super().build(input_shape)
-        
-    def call(self, x, seq_len=None):
-        """
-        Apply rotary position embedding to input tensor
-        x: [batch_size, seq_len, num_heads, head_dim]
-        """
-        if seq_len is None:
-            seq_len = tf.shape(x)[1]
         
         # Create position indices
-        position = tf.range(seq_len, dtype=tf.float32)
-        position = tf.expand_dims(position, 1)  # [seq_len, 1]
+        position = tf.range(max_seq_len, dtype=tf.float32)
+        div_term = tf.exp(tf.range(0, dim, 2, dtype=tf.float32) * -(tf.math.log(10000.0) / dim))
         
-        # Compute frequencies
-        freqs = tf.matmul(position, tf.expand_dims(self.inv_freq, 0))  # [seq_len, dim//2]
-        
-        # Create sin and cos
-        sin_vals = tf.sin(freqs)  # [seq_len, dim//2]
-        cos_vals = tf.cos(freqs)  # [seq_len, dim//2]
-        
-        # Expand dimensions for broadcasting
-        sin_vals = tf.expand_dims(tf.expand_dims(sin_vals, 0), 2)  # [1, seq_len, 1, dim//2]
-        cos_vals = tf.expand_dims(tf.expand_dims(cos_vals, 0), 2)  # [1, seq_len, 1, dim//2]
-        
-        # Apply rotary embedding
-        x_rotated = self._apply_rotary_pos_emb(x, sin_vals, cos_vals)
-        
-        return x_rotated
+        # Calculate sin and cos values
+        pos = tf.expand_dims(position, 1) * tf.expand_dims(div_term, 0)
+        self.sin_vals = tf.sin(pos)
+        self.cos_vals = tf.cos(pos)
     
     def _apply_rotary_pos_emb(self, x, sin, cos):
-        """Apply the actual rotary transformation"""
-        # Split x into two halves
-        x1 = x[..., ::2]   # Even indices
-        x2 = x[..., 1::2]  # Odd indices
+        """Apply rotary positional embeddings to input tensor."""
+        # Reshape input for broadcasting
+        x_shape = tf.shape(x)
+        batch_size = x_shape[0]
+        seq_len = x_shape[1]
         
-        # Apply rotation
-        # cos * x + sin * rotate(x) where rotate swaps x1 and x2 with sign flip
+        # Reshape sin and cos for broadcasting
+        sin = tf.expand_dims(sin[:seq_len], 0)  # [1, seq_len, dim/2]
+        cos = tf.expand_dims(cos[:seq_len], 0)  # [1, seq_len, dim/2]
+        
+        # Split input into real and imaginary parts
+        x1, x2 = tf.split(x, 2, axis=-1)
+        
+        # Apply rotary embeddings
         rotated_x1 = cos * x1 - sin * x2
         rotated_x2 = sin * x1 + cos * x2
         
-        # Interleave back
-        rotated = tf.stack([rotated_x1, rotated_x2], axis=-1)
-        rotated = tf.reshape(rotated, tf.shape(x))
+        # Concatenate rotated parts
+        return tf.concat([rotated_x1, rotated_x2], axis=-1)
+    
+    def call(self, x, seq_len=None):
+        """Apply rotary positional embeddings."""
+        if seq_len is None:
+            seq_len = tf.shape(x)[1]
         
-        return rotated
+        # Get sin and cos values for the sequence length
+        sin = self.sin_vals[:seq_len]
+        cos = self.cos_vals[:seq_len]
+        
+        # Apply rotary embeddings
+        return self._apply_rotary_pos_emb(x, sin, cos)
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'dim': self.dim,
+            'max_seq_len': self.max_seq_len
+        })
+        return config
 
 class CustomMultiHeadAttention(layers.Layer):
     """
