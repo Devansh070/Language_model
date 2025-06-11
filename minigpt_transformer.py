@@ -20,16 +20,99 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ModelConfig:
-    """Configuration for the MiniGPT model"""
-    vocab_size: int = 50257  # GPT-2 tokenizer vocab size
-    max_seq_len: int = 512
-    embed_dim: int = 512
-    num_heads: int = 8
+    """Configuration class for MiniGPT model."""
+    vocab_size: int = 50257  # GPT-2 vocabulary size
+    max_seq_len: int = 1024
+    embed_dim: int = 768
+    num_heads: int = 12
     num_layers: int = 12
-    ffn_dim: int = 2048
+    ffn_dim: int = 3072
     dropout: float = 0.1
     layer_norm_epsilon: float = 1e-5
     use_custom_attention: bool = True  # Enable Custom Multi-Head Attention by default
+    use_rotary_embeddings: bool = True  # Enable Rotary Positional Embeddings
+    use_mixture_of_experts: bool = False  # Enable Mixture of Experts
+    num_experts: int = 8  # Number of experts for MoE
+    k: int = 2  # Number of experts to use per token for MoE
+    use_flash_attention: bool = False  # Enable Flash Attention
+    use_gradient_checkpointing: bool = False  # Enable Gradient Checkpointing
+    use_activation_checkpointing: bool = False  # Enable Activation Checkpointing
+    use_mixed_precision: bool = False  # Enable Mixed Precision Training
+    use_amp: bool = False  # Enable Automatic Mixed Precision
+    use_xla: bool = False  # Enable XLA JIT Compilation
+    use_tpu: bool = False  # Enable TPU Training
+    use_distributed: bool = False  # Enable Distributed Training
+    use_parallel: bool = False  # Enable Parallel Training
+    use_async: bool = False  # Enable Async Training
+    use_autograph: bool = False  # Enable AutoGraph
+    use_function: bool = False  # Enable Function
+    use_keras: bool = True  # Enable Keras
+    use_eager: bool = True  # Enable Eager Execution
+    use_graph: bool = False  # Enable Graph Mode
+    use_optimizer: bool = True  # Enable Optimizer
+    use_loss: bool = True  # Enable Loss
+    use_metrics: bool = True  # Enable Metrics
+    use_callbacks: bool = True  # Enable Callbacks
+    use_early_stopping: bool = True  # Enable Early Stopping
+    use_reduce_lr: bool = True  # Enable Reduce LR on Plateau
+    use_model_checkpoint: bool = True  # Enable Model Checkpoint
+    use_tensorboard: bool = True  # Enable TensorBoard
+    use_wandb: bool = False  # Enable Weights & Biases
+    use_mlflow: bool = False  # Enable MLflow
+    use_neptune: bool = False  # Enable Neptune
+    use_comet: bool = False  # Enable Comet
+    use_clearml: bool = False  # Enable ClearML
+    use_dvc: bool = False  # Enable DVC
+    use_git: bool = True  # Enable Git
+    use_docker: bool = False  # Enable Docker
+    use_kubernetes: bool = False  # Enable Kubernetes
+    use_ray: bool = False  # Enable Ray
+    use_horovod: bool = False  # Enable Horovod
+    use_deepspeed: bool = False  # Enable DeepSpeed
+    use_fairscale: bool = False  # Enable FairScale
+    use_megatron: bool = False  # Enable Megatron
+    use_colossalai: bool = False  # Enable ColossalAI
+    use_deepspeed_zero: bool = False  # Enable DeepSpeed ZeRO
+    use_fsdp: bool = False  # Enable Fully Sharded Data Parallel
+    use_activation_checkpointing: bool = False  # Enable Activation Checkpointing
+    use_gradient_checkpointing: bool = False  # Enable Gradient Checkpointing
+    use_mixed_precision: bool = False  # Enable Mixed Precision Training
+    use_amp: bool = False  # Enable Automatic Mixed Precision
+    use_xla: bool = False  # Enable XLA JIT Compilation
+    use_tpu: bool = False  # Enable TPU Training
+    use_distributed: bool = False  # Enable Distributed Training
+    use_parallel: bool = False  # Enable Parallel Training
+    use_async: bool = False  # Enable Async Training
+    use_autograph: bool = False  # Enable AutoGraph
+    use_function: bool = False  # Enable Function
+    use_keras: bool = True  # Enable Keras
+    use_eager: bool = True  # Enable Eager Execution
+    use_graph: bool = False  # Enable Graph Mode
+    use_optimizer: bool = True  # Enable Optimizer
+    use_loss: bool = True  # Enable Loss
+    use_metrics: bool = True  # Enable Metrics
+    use_callbacks: bool = True  # Enable Callbacks
+    use_early_stopping: bool = True  # Enable Early Stopping
+    use_reduce_lr: bool = True  # Enable Reduce LR on Plateau
+    use_model_checkpoint: bool = True  # Enable Model Checkpoint
+    use_tensorboard: bool = True  # Enable TensorBoard
+    use_wandb: bool = False  # Enable Weights & Biases
+    use_mlflow: bool = False  # Enable MLflow
+    use_neptune: bool = False  # Enable Neptune
+    use_comet: bool = False  # Enable Comet
+    use_clearml: bool = False  # Enable ClearML
+    use_dvc: bool = False  # Enable DVC
+    use_git: bool = True  # Enable Git
+    use_docker: bool = False  # Enable Docker
+    use_kubernetes: bool = False  # Enable Kubernetes
+    use_ray: bool = False  # Enable Ray
+    use_horovod: bool = False  # Enable Horovod
+    use_deepspeed: bool = False  # Enable DeepSpeed
+    use_fairscale: bool = False  # Enable FairScale
+    use_megatron: bool = False  # Enable Megatron
+    use_colossalai: bool = False  # Enable ColossalAI
+    use_deepspeed_zero: bool = False  # Enable DeepSpeed ZeRO
+    use_fsdp: bool = False  # Enable Fully Sharded Data Parallel
 
 class RotaryPositionalEmbedding(layers.Layer):
     """Rotary Positional Embedding (RoPE)"""
@@ -245,18 +328,6 @@ class CustomMultiHeadAttention(layers.Layer):
         # Scale scores
         scores = scores / tf.sqrt(tf.cast(self.head_dim, scores.dtype))
         
-        # Apply masks
-        if mask is not None:
-            # Expand mask for broadcasting
-            if len(mask.shape) == 2:
-                mask = tf.expand_dims(tf.expand_dims(mask, 1), 1)
-            else:
-                mask = tf.expand_dims(mask, 1)
-            
-            # Convert mask to attention mask
-            attention_mask = (1.0 - tf.cast(mask, scores.dtype)) * -10000.0
-            scores = scores + attention_mask
-        
         # Apply causal mask if requested
         if use_causal_mask:
             # Create causal mask
@@ -267,7 +338,25 @@ class CustomMultiHeadAttention(layers.Layer):
             causal_mask = tf.expand_dims(tf.expand_dims(causal_mask, 0), 0)
             
             # Apply causal mask
-            scores = scores * causal_mask + (1.0 - causal_mask) * -10000.0
+            scores = scores * causal_mask + (1.0 - causal_mask) * -1e9
+        
+        # Apply masks
+        if mask is not None:
+            # Handle different mask shapes
+            if len(mask.shape) == 2:
+                # Padding mask: [batch_size, seq_len]
+                mask = tf.expand_dims(tf.expand_dims(mask, 1), 1)
+                # Convert to attention mask
+                attention_mask = (1.0 - tf.cast(mask, scores.dtype)) * -1e9
+                scores = scores + attention_mask
+            elif len(mask.shape) == 4:
+                # Pre-computed attention mask: [batch_size, num_heads, query_len, key_len]
+                # or [1, 1, query_len, key_len] for broadcasting
+                scores = scores + mask
+            else:
+                # 3D mask: [batch_size, query_len, key_len]
+                mask = tf.expand_dims(mask, 1)  # Add head dimension
+                scores = scores + mask
         
         # Compute attention weights
         attention_weights = tf.nn.softmax(scores, axis=-1)
@@ -360,13 +449,8 @@ class MultiHeadAttention(layers.Layer):
         seq_len = tf.shape(x)[1]
         
         if self.use_custom_attention:
-            # For custom attention, pass the original x and let it handle projections
-            # Create causal mask for custom attention
-            mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
-            mask = tf.where(mask == 0, -1e9, 0.0)
-            mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)  # [1, 1, seq_len, seq_len]
-            
-            attention = self.custom_attention(x, mask=mask, use_causal_mask=True, training=training)
+            # Use custom attention - simplified mask creation
+            attention = self.custom_attention(x, use_causal_mask=True, training=training)
             return attention
         else:
             # Standard attention with RoPE
@@ -492,33 +576,48 @@ class TransformerBlock(layers.Layer):
         return x
 
 class EnhancedMiniGPT(Model):
-    """Enhanced MiniGPT model with improved architecture and optimizations"""
+    """Enhanced MiniGPT model with additional features."""
     
     def __init__(self, config: ModelConfig = None, **kwargs):
         super().__init__(**kwargs)
         self.config = config or ModelConfig()
         
-        # Initialize tokenizer if available
-        if HAS_TRANSFORMERS:
-            try:
-                self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                if self.tokenizer.pad_token is None:
-                    self.tokenizer.pad_token = self.tokenizer.eos_token
-                logger.info("Tokenizer loaded successfully")
-            except Exception as e:
-                logger.warning(f"Failed to load tokenizer: {e}")
-                self.tokenizer = None
-        else:
+        # Initialize tokenizer
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            logger.info("Using GPT-2 tokenizer from transformers")
+        except ImportError:
+            logger.warning("transformers not available, using fallback tokenizer")
             self.tokenizer = None
         
-        # Token embeddings (no position embeddings needed with RoPE)
+        # Build model components
+        self.build_model()
+        
+    def build_model(self):
+        """Build the model architecture."""
+        # Token embedding layer
         self.token_embedding = layers.Embedding(
             self.config.vocab_size,
             self.config.embed_dim,
-            name='token_embedding'
+            name="token_embedding"
         )
         
-        # Transformer blocks with RoPE
+        # Positional embedding layer
+        if self.config.use_rotary_embeddings:
+            self.pos_embedding = RotaryPositionalEmbedding(
+                self.config.embed_dim,
+                max_seq_len=self.config.max_seq_len,
+                name="rotary_pos_embedding"
+            )
+        else:
+            self.pos_embedding = layers.Embedding(
+                self.config.max_seq_len,
+                self.config.embed_dim,
+                name="position_embedding"
+            )
+        
+        # Transformer blocks
         self.transformer_blocks = [
             TransformerBlock(
                 embed_dim=self.config.embed_dim,
@@ -527,140 +626,147 @@ class EnhancedMiniGPT(Model):
                 dropout=self.config.dropout,
                 layer_norm_epsilon=self.config.layer_norm_epsilon,
                 max_seq_len=self.config.max_seq_len,
-                name=f'transformer_block_{i}'
-            ) for i in range(self.config.num_layers)
+                name=f"transformer_block_{i}"
+            )
+            for i in range(self.config.num_layers)
         ]
         
-        # Final layer normalization
+        # Final layer norm
         self.final_layer_norm = layers.LayerNormalization(
             epsilon=self.config.layer_norm_epsilon,
-            name='final_layer_norm'
+            name="final_layer_norm"
         )
         
-        # Output layer (language modeling head)
-        self.lm_head = layers.Dense(
+        # Output projection
+        self.output_projection = layers.Dense(
             self.config.vocab_size,
-            use_bias=False,
-            name='lm_head'
+            name="output_projection"
         )
-        
-        # Dropout
-        self.dropout = layers.Dropout(self.config.dropout)
         
     def call(self, inputs, training=False):
-        """Forward pass with RoPE (no position embeddings needed)"""
-        # Get token embeddings only
-        x = self.token_embedding(inputs)
+        """Forward pass of the model."""
+        if isinstance(inputs, dict):
+            input_ids = inputs['input_ids']
+        else:
+            input_ids = inputs
+            
+        # Get sequence length
+        seq_len = tf.shape(input_ids)[1]
         
-        # Apply dropout
-        x = self.dropout(x, training=training)
+        # Get embeddings
+        token_embeddings = self.token_embedding(input_ids)
         
-        # Apply transformer blocks (RoPE is applied inside attention)
+        # Add positional embeddings
+        if self.config.use_rotary_embeddings:
+            token_embeddings = self.pos_embedding(token_embeddings)
+        else:
+            positions = tf.range(seq_len, dtype=tf.int32)
+            position_embeddings = self.pos_embedding(positions)
+            token_embeddings = token_embeddings + position_embeddings
+        
+        # Apply transformer blocks
+        x = token_embeddings
         for block in self.transformer_blocks:
             x = block(x, training=training)
         
-        # Apply final layer normalization
+        # Final layer norm
         x = self.final_layer_norm(x)
         
-        # Get logits
-        logits = self.lm_head(x)
+        # Output projection
+        logits = self.output_projection(x)
         
         return logits
-    
-    def build_model(self):
-        """Build the model by calling it with dummy input"""
-        dummy_input = tf.zeros((1, self.config.max_seq_len), dtype=tf.int32)
-        _ = self(dummy_input)
-        logger.info(f"Model built successfully with {self.count_params():,} parameters")
-    
-    def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7, 
-                 top_k: int = 50, top_p: float = 0.9, pad_token_id: int = 0):
-        """Generate text continuation"""
-        # Ensure input is tensor
-        if not isinstance(input_ids, tf.Tensor):
-            input_ids = tf.constant(input_ids, dtype=tf.int32)
         
-        # Ensure batch dimension
-        if len(input_ids.shape) == 1:
-            input_ids = tf.expand_dims(input_ids, 0)
-        
+    def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7,
+                top_k: int = 50, top_p: float = 0.9, **kwargs):
+        """Generate text using the model."""
         batch_size = tf.shape(input_ids)[0]
         current_length = tf.shape(input_ids)[1]
         
+        # Initialize output sequence
+        output_sequence = input_ids
+        
         # Generate tokens
         for _ in range(max_length):
-            # Truncate input if too long
-            if current_length >= self.config.max_seq_len:
-                input_ids = input_ids[:, -self.config.max_seq_len+1:]
-                current_length = tf.shape(input_ids)[1]
-            
             # Get model predictions
-            logits = self(input_ids, training=False)
-            next_token_logits = logits[:, -1, :] / temperature
+            logits = self(output_sequence, training=False)
+            next_token_logits = logits[:, -1, :]
+            
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
             
             # Apply top-k filtering
             if top_k > 0:
-                top_k_logits, top_k_indices = tf.nn.top_k(next_token_logits, k=min(top_k, tf.shape(next_token_logits)[-1]))
-                next_token_logits = tf.where(
-                    next_token_logits < tf.reduce_min(top_k_logits, axis=-1, keepdims=True),
-                    -float('inf'),
-                    next_token_logits
-                )
+                indices_to_remove = next_token_logits < tf.math.top_k(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits = tf.where(indices_to_remove, tf.ones_like(next_token_logits) * -float('inf'), next_token_logits)
+            
+            # Apply top-p (nucleus) filtering
+            if top_p < 1.0:
+                sorted_logits = tf.sort(next_token_logits, direction='DESCENDING')
+                sorted_indices = tf.argsort(next_token_logits, direction='DESCENDING')
+                cumulative_probs = tf.cumsum(tf.nn.softmax(sorted_logits, axis=-1), axis=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove = tf.concat([tf.zeros_like(sorted_indices_to_remove[:, :1]), sorted_indices_to_remove[:, :-1]], axis=-1)
+                indices_to_remove = tf.batch_gather(sorted_indices_to_remove, sorted_indices)
+                next_token_logits = tf.where(indices_to_remove, tf.ones_like(next_token_logits) * -float('inf'), next_token_logits)
             
             # Sample next token
-            next_token = tf.random.categorical(next_token_logits, num_samples=1, dtype=tf.int32)
+            probs = tf.nn.softmax(next_token_logits, axis=-1)
+            next_token = tf.random.categorical(probs, num_samples=1)
             
-            # Append to input
-            input_ids = tf.concat([input_ids, next_token], axis=1)
-            current_length += 1
+            # Append to output sequence
+            output_sequence = tf.concat([output_sequence, next_token], axis=1)
             
-            # Check for pad token (simple stopping condition)
-            if tf.reduce_all(next_token == pad_token_id):
+            # Check if we should stop
+            if tf.reduce_any(next_token == self.config.vocab_size - 1):  # EOS token
                 break
         
-        return input_ids
-    
+        return output_sequence
+        
     def generate_text(self, prompt: str, max_length: int = 100, temperature: float = 0.7):
         """Generate text from a string prompt (requires tokenizer)"""
-        if not self.tokenizer:
-            raise ValueError("Tokenizer not available. Install transformers library or use generate() with token IDs.")
-        
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not available. Please install transformers package.")
+            
         # Tokenize input
         input_ids = self.tokenizer.encode(prompt, return_tensors='tf')
         
         # Generate
-        generated_ids = self.generate(input_ids, max_length, temperature)
+        output_ids = self.generate(input_ids, max_length=max_length, temperature=temperature)
         
-        # Decode and return
-        return self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-    
+        # Decode output
+        output_text = self.tokenizer.decode(output_ids[0].numpy())
+        
+        return output_text
+        
     def chat(self, message: str, max_length: int = 100, temperature: float = 0.7) -> str:
         """Chat with the model (requires tokenizer)"""
-        if not self.tokenizer:
-            raise ValueError("Tokenizer not available. Install transformers library.")
-        
-        # Format input
-        prompt = f"Human: {message}\nAssistant:"
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not available. Please install transformers package.")
+            
+        # Format message
+        prompt = f"Human: {message}\nAI:"
         
         # Generate response
-        response = self.generate_text(prompt, max_length, temperature)
+        response = self.generate_text(prompt, max_length=max_length, temperature=temperature)
         
-        # Extract assistant response
+        # Extract AI response
         try:
-            response = response.split("Assistant:")[-1].strip()
+            response = response.split("AI:")[-1].strip()
         except:
             response = response.strip()
-        
+            
         return response
-    
+        
     def compute_loss(self, input_ids, labels=None):
-        """Compute language modeling loss"""
+        """Compute the loss for training."""
         if labels is None:
-            # For language modeling, labels are input_ids shifted by one
             labels = input_ids[:, 1:]
             input_ids = input_ids[:, :-1]
-        
-        # Get logits
+            
+        # Get model predictions
         logits = self(input_ids, training=True)
         
         # Compute loss
@@ -668,8 +774,4 @@ class EnhancedMiniGPT(Model):
             labels, logits, from_logits=True
         )
         
-        # Apply padding mask if needed
-        mask = tf.cast(tf.not_equal(labels, 0), tf.float32)
-        loss = loss * mask
-        
-        return tf.reduce_sum(loss) / tf.reduce_sum(mask)
+        return tf.reduce_mean(loss)

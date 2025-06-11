@@ -5,7 +5,15 @@ import logging
 from datetime import datetime
 import json
 from pathlib import Path
-from minigpt_transformer import EnhancedMiniGPT, ModelConfig, CustomMultiHeadAttention, MultiHeadAttention, RotaryPositionalEmbedding, FeedForward, TransformerBlock
+from minigpt_transformer import (
+    EnhancedMiniGPT,
+    ModelConfig,
+    CustomMultiHeadAttention,
+    MultiHeadAttention,
+    RotaryPositionalEmbedding,
+    FeedForward,
+    TransformerBlock
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -170,265 +178,182 @@ def setup_callbacks(checkpoint_dir="./checkpoints", monitor='loss'):
     return callbacks
 
 def train_model():
-    """Main training function"""
-    try:
-        # Import your model classes here
-        # from enhanced_minigpt import EnhancedMiniGPT, ModelConfig
-        
-        logger.info("Starting MiniGPT training")
-        
-        # Configuration
-        config = ModelConfig(
-            vocab_size=50257,
-            max_seq_len=512,
-            embed_dim=512,
-            num_heads=8,
-            num_layers=12,
-            ffn_dim=2048,
-            dropout=0.1,
-            use_custom_attention=True
-        )
-        
-        # Create model
-        logger.info("Creating model...")
-        model = EnhancedMiniGPT(config)
-        
-        # Build model
-        model.build_model()
-        logger.info(f"Model created with {model.count_params():,} parameters")
-        print(f"Model created with {model.count_params():,} parameters")
-        
-        # Setup optimizer
-        initial_learning_rate = 1e-4
-        lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=initial_learning_rate,
-            decay_steps=10000,
-            alpha=0.1
-        )
-        
-        optimizer = tf.keras.optimizers.AdamW(
-            learning_rate=lr_schedule,
-            weight_decay=0.01,
-            beta_1=0.9,
-            beta_2=0.95,
-            epsilon=1e-8
-        )
-        
-        # Compile model
-        model.compile(
-            optimizer=optimizer,
-            loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-            metrics=['accuracy']
-        )
-        
-        # Create dataset
-        logger.info("Creating dataset...")
-        
-        # Try to load from text file first, fallback to dummy data
-        text_file = "train_data.txt"  # Change this to your text file path
-        dataset = None
-        
-        if model.tokenizer and os.path.exists(text_file):
-            dataset = create_text_dataset(text_file, model.tokenizer, 
-                                        seq_len=config.max_seq_len, batch_size=8)
-            logger.info(f"Loaded dataset from {text_file}")
-        
-        if dataset is None:
-            logger.info("Using dummy dataset for testing")
-            dataset = create_dummy_dataset(
-                vocab_size=config.vocab_size,
-                seq_len=config.max_seq_len,
-                batch_size=8,
-                num_samples=1000
-            )
-        
-        # Setup callbacks
-        callbacks = setup_callbacks(checkpoint_dir="./checkpoints")
-        
-        # Training parameters
-        epochs = 10
-        steps_per_epoch = 100
-        
-        logger.info(f"Starting training for {epochs} epochs with {steps_per_epoch} steps per epoch")
-        
-        # Custom training loop with metrics
-        @tf.function
-        def train_step(batch):
-            input_ids = batch['input_ids']
-            labels = input_ids[:, 1:]  # Shift input_ids by 1 for next token prediction
-            input_ids = input_ids[:, :-1]  # Remove last token from input
-            
-            with tf.GradientTape() as tape:
-                # Forward pass
-                logits = model(input_ids, training=True)
-                
-                # Calculate loss
-                loss = tf.keras.losses.sparse_categorical_crossentropy(
-                    labels, logits, from_logits=True
-                )
-                loss = tf.reduce_mean(loss)
-                
-                # Calculate perplexity
-                perplexity = tf.exp(loss)
-                
-                # Calculate accuracy
-                predictions = tf.argmax(logits, axis=-1)
-                accuracy = tf.reduce_mean(
-                    tf.cast(tf.equal(predictions, labels), tf.float32)
-                )
-            
-            # Calculate gradients and apply them
-            gradients = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            
-            return loss, perplexity, accuracy
-        
-        # Training loop
-        logger.info("Starting training...")
-        for epoch in range(epochs):
-            epoch_loss = 0
-            epoch_perplexity = 0
-            epoch_accuracy = 0
-            
-            # Progress bar
-            progress_bar = tf.keras.utils.Progbar(
-                steps_per_epoch,
-                stateful_metrics=['loss', 'perplexity', 'accuracy']
-            )
-            
-            for step in range(steps_per_epoch):
-                # Get batch
-                batch = next(iter(dataset))
-                
-                # Training step
-                loss, perplexity, accuracy = train_step(batch)
-                
-                # Update metrics
-                epoch_loss += loss
-                epoch_perplexity += perplexity
-                epoch_accuracy += accuracy
-                
-                # Update progress bar
-                progress_bar.update(
-                    step + 1,
-                    values=[
-                        ('loss', loss),
-                        ('perplexity', perplexity),
-                        ('accuracy', accuracy)
-                    ]
-                )
-            
-            # Calculate epoch averages
-            epoch_loss /= steps_per_epoch
-            epoch_perplexity /= steps_per_epoch
-            epoch_accuracy /= steps_per_epoch
-            
-            # Log metrics
-            logger.info(
-                f"Epoch {epoch + 1}/{epochs} - "
-                f"Loss: {epoch_loss:.4f} - "
-                f"Perplexity: {epoch_perplexity:.4f} - "
-                f"Accuracy: {epoch_accuracy:.4f}"
-            )
-            
-            # Save checkpoint
-            checkpoint_path = os.path.join(
-                "./checkpoints",
-                f"minigpt_epoch_{epoch + 1:02d}_loss_{epoch_loss:.4f}.keras"
-            )
-            model.save(checkpoint_path)
-            logger.info(f"Saved checkpoint: {checkpoint_path}")
-        
-        # Save final model
-        final_path = os.path.join("./checkpoints", "minigpt_final.keras")
-        model.save(final_path)
-        logger.info(f"Training completed. Final model saved to: {final_path}")
-        
-        return model
-
-    except Exception as e:
-        logger.error(f"Training failed: {e}")
-        raise
-
-def load_and_test_model(model_path="./checkpoints/minigpt_final.keras"):
-    """Load and test the trained model"""
-    try:
-        # Load model
-        if model_path.endswith('.weights.h5'):
-            # Create model with same config
-            config = ModelConfig()
-            model = EnhancedMiniGPT(config)
-            model.build_model()
-            model.load_weights(model_path)
-            logger.info(f"Loaded model weights from {model_path}")
-        else:
-            model = tf.keras.models.load_model(model_path, custom_objects={
-                'EnhancedMiniGPT': EnhancedMiniGPT,
-                'ModelConfig': ModelConfig,
-                'CustomMultiHeadAttention': CustomMultiHeadAttention,
-                'MultiHeadAttention': MultiHeadAttention,
-                'RotaryPositionalEmbedding': RotaryPositionalEmbedding,
-                'FeedForward': FeedForward,
-                'TransformerBlock': TransformerBlock
-            })
-            logger.info(f"Loaded full model from {model_path}")
-        
-        # Create test dataset
-        test_dataset = create_dummy_dataset(
-            vocab_size=50257,
-            seq_len=512,
-            batch_size=8,
-            num_samples=100
-        )
-        
-        # Test metrics
-        total_loss = 0
-        total_perplexity = 0
-        total_accuracy = 0
-        num_batches = 0
-        
-        for batch in test_dataset:
-            input_ids = batch['input_ids']
-            labels = input_ids[:, 1:]
-            input_ids = input_ids[:, :-1]
-            
+    """Train the MiniGPT model."""
+    # Create model configuration
+    config = ModelConfig(
+        vocab_size=50257,  # GPT-2 vocabulary size
+        max_seq_len=1024,
+        embed_dim=768,
+        num_heads=12,
+        num_layers=12,
+        ffn_dim=3072,
+        dropout=0.1,
+        use_custom_attention=True,
+        use_rotary_embeddings=True
+    )
+    
+    # Create model
+    model = EnhancedMiniGPT(config)
+    
+    # Create optimizer with learning rate schedule
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=1e-4,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-8
+    )
+    
+    # Create loss function
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+    
+    # Create metrics
+    train_loss = tf.keras.metrics.Mean(name='train_loss')
+    train_perplexity = tf.keras.metrics.Mean(name='train_perplexity')
+    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+    
+    val_loss = tf.keras.metrics.Mean(name='val_loss')
+    val_perplexity = tf.keras.metrics.Mean(name='val_perplexity')
+    val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
+    
+    # Create checkpoint manager
+    checkpoint_dir = './checkpoints'
+    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+    checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
+    
+    # Create TensorBoard writer
+    current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
+    train_log_dir = os.path.join('logs', 'gradient_tape', current_time, 'train')
+    val_log_dir = os.path.join('logs', 'gradient_tape', current_time, 'val')
+    train_summary_writer = tf.summary.create_file_writer(train_log_dir)
+    val_summary_writer = tf.summary.create_file_writer(val_log_dir)
+    
+    # Training loop
+    @tf.function
+    def train_step(input_ids, labels):
+        with tf.GradientTape() as tape:
             # Forward pass
-            logits = model(input_ids, training=False)
+            logits = model(input_ids, training=True)
             
-            # Calculate metrics
-            loss = tf.keras.losses.sparse_categorical_crossentropy(
-                labels, logits, from_logits=True
-            )
-            loss = tf.reduce_mean(loss)
-            perplexity = tf.exp(loss)
+            # Compute loss
+            loss = loss_fn(labels, logits)
             
-            predictions = tf.argmax(logits, axis=-1)
-            accuracy = tf.reduce_mean(
-                tf.cast(tf.equal(predictions, labels), tf.float32)
-            )
-            
-            total_loss += loss
-            total_perplexity += perplexity
-            total_accuracy += accuracy
-            num_batches += 1
+            # Add regularization losses
+            loss += tf.reduce_sum(model.losses)
         
-        # Calculate averages
-        avg_loss = total_loss / num_batches
-        avg_perplexity = total_perplexity / num_batches
-        avg_accuracy = total_accuracy / num_batches
+        # Compute gradients
+        gradients = tape.gradient(loss, model.trainable_variables)
         
+        # Apply gradients
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        
+        # Update metrics
+        train_loss.update_state(loss)
+        train_perplexity.update_state(tf.exp(loss))
+        train_accuracy.update_state(labels, logits)
+        
+        return loss
+    
+    @tf.function
+    def val_step(input_ids, labels):
+        # Forward pass
+        logits = model(input_ids, training=False)
+        
+        # Compute loss
+        loss = loss_fn(labels, logits)
+        
+        # Update metrics
+        val_loss.update_state(loss)
+        val_perplexity.update_state(tf.exp(loss))
+        val_accuracy.update_state(labels, logits)
+        
+        return loss
+    
+    # Training loop
+    num_epochs = 10
+    steps_per_epoch = 1000  # Adjust based on your dataset size
+    
+    for epoch in range(num_epochs):
+        logger.info(f"Epoch {epoch + 1}/{num_epochs}")
+        
+        # Reset metrics
+        train_loss.reset_states()
+        train_perplexity.reset_states()
+        train_accuracy.reset_states()
+        val_loss.reset_states()
+        val_perplexity.reset_states()
+        val_accuracy.reset_states()
+        
+        # Training
+        for step in range(steps_per_epoch):
+            # Get batch
+            batch = next(iter(train_dataset))
+            input_ids = batch['input_ids']
+            labels = input_ids[:, 1:]  # Shift labels by one position
+            
+            # Train step
+            loss = train_step(input_ids, labels)
+            
+            # Log progress
+            if step % 100 == 0:
+                logger.info(f"Step {step}/{steps_per_epoch}, Loss: {loss:.4f}")
+        
+        # Validation
+        for val_batch in val_dataset:
+            input_ids = val_batch['input_ids']
+            labels = input_ids[:, 1:]
+            val_step(input_ids, labels)
+        
+        # Log metrics
+        with train_summary_writer.as_default():
+            tf.summary.scalar('loss', train_loss.result(), step=epoch)
+            tf.summary.scalar('perplexity', train_perplexity.result(), step=epoch)
+            tf.summary.scalar('accuracy', train_accuracy.result(), step=epoch)
+        
+        with val_summary_writer.as_default():
+            tf.summary.scalar('loss', val_loss.result(), step=epoch)
+            tf.summary.scalar('perplexity', val_perplexity.result(), step=epoch)
+            tf.summary.scalar('accuracy', val_accuracy.result(), step=epoch)
+        
+        # Print metrics
         logger.info(
-            f"Test Results:\n"
-            f"Loss: {avg_loss:.4f}\n"
-            f"Perplexity: {avg_perplexity:.4f}\n"
-            f"Accuracy: {avg_accuracy:.4f}"
+            f"Epoch {epoch + 1} - "
+            f"Train Loss: {train_loss.result():.4f}, "
+            f"Train Perplexity: {train_perplexity.result():.4f}, "
+            f"Train Accuracy: {train_accuracy.result():.4f}, "
+            f"Val Loss: {val_loss.result():.4f}, "
+            f"Val Perplexity: {val_perplexity.result():.4f}, "
+            f"Val Accuracy: {val_accuracy.result():.4f}"
         )
         
-        return model
+        # Save checkpoint
+        checkpoint.save(file_prefix=checkpoint_prefix)
+    
+    # Save final model
+    model.save_weights('./checkpoints/minigpt_final.keras')
+    logger.info("Training completed. Model saved to ./checkpoints/minigpt_final.keras")
+    
+    return model
+
+def chat_loop(model):
+    """Interactive chat loop with the model."""
+    logger.info("Starting chat loop. Type 'quit' to exit.")
+    
+    while True:
+        # Get user input
+        user_input = input("\nYou: ").strip()
         
-    except Exception as e:
-        logger.error(f"Testing failed: {e}")
-        raise
+        # Check for quit command
+        if user_input.lower() == 'quit':
+            logger.info("Exiting chat loop.")
+            break
+        
+        try:
+            # Generate response
+            response = model.chat(user_input)
+            print(f"\nAI: {response}")
+        except Exception as e:
+            logger.error(f"Error generating response: {e}")
+            print("\nAI: I apologize, but I encountered an error. Please try again.")
 
 if __name__ == "__main__":
     # Set memory growth for GPU
@@ -444,48 +369,5 @@ if __name__ == "__main__":
     # Train model
     model = train_model()
     
-    # Test model
-    test_model = load_and_test_model()
-    
-    # Interactive chat loop
-    def chat_loop(model):
-        print("\nStarting chat session. Type 'quit' to exit.")
-        print("Model is ready to chat!")
-        
-        while True:
-            try:
-                # Get user input
-                user_input = input("\nYou: ").strip()
-                
-                # Check for quit command
-                if user_input.lower() == 'quit':
-                    print("\nEnding chat session. Goodbye!")
-                    break
-                
-                # Skip empty messages
-                if not user_input:
-                    continue
-                
-                # Generate response
-                response = model.chat(
-                    message=user_input,
-                    max_length=100,
-                    temperature=0.7
-                )
-                
-                # Print response
-                print(f"\nAssistant: {response}")
-                
-            except KeyboardInterrupt:
-                print("\n\nChat session interrupted. Goodbye!")
-                break
-            except Exception as e:
-                print(f"\nError: {e}")
-                print("Please try again or type 'quit' to exit.")
-    
-    # Start chat loop if model has tokenizer
-    if model.tokenizer:
-        chat_loop(model)
-    else:
-        print("\nWarning: No tokenizer available. Chat functionality is disabled.")
-        print("Please install transformers library to enable chat functionality.")
+    # Start chat loop
+    chat_loop(model)
