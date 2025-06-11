@@ -489,7 +489,7 @@ class TransformerBlock(layers.Layer):
         # Dropout
         self.dropout = layers.Dropout(dropout)
         
-    def call(self, x, training=False):
+    def call(self, x, training=False, mask=None):
         # Pre-norm attention
         attn_input = self.ln1(x)
         attn_output = self.attention(attn_input, training=training)
@@ -504,105 +504,86 @@ class TransformerBlock(layers.Layer):
         
         return x
 
-class EnhancedMiniGPT(Model):
-    """Enhanced MiniGPT model with additional features."""
+class EnhancedMiniGPT(tf.keras.Model):
+    """Enhanced MiniGPT model with custom attention and rotary embeddings."""
     
-    def __init__(self, config: ModelConfig = None, **kwargs):
-        super().__init__(**kwargs)
-        self.config = config or ModelConfig()
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
         
-        # Initialize tokenizer
-        try:
-            from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
-            logger.info("Using GPT-2 tokenizer from transformers")
-        except ImportError:
-            logger.warning("transformers not available, using fallback tokenizer")
-            self.tokenizer = None
-        
-        # Build model components
-        self.build_model()
-        
-    def build_model(self):
-        """Build the model architecture."""
-        # Token embedding layer
+        # Token embeddings
         self.token_embedding = layers.Embedding(
-            self.config.vocab_size,
-            self.config.embed_dim,
-            name="token_embedding"
+            config.vocab_size,
+            config.embed_dim,
+            dtype='float32'  # Keep embeddings in float32 for stability
         )
         
-        # Positional embedding layer
-        if self.config.use_rotary_embeddings:
-            self.pos_embedding = RotaryPositionalEmbedding(
-                self.config.embed_dim,
-                max_seq_len=self.config.max_seq_len,
-                name="rotary_pos_embedding"
-            )
-        else:
-            self.pos_embedding = layers.Embedding(
-                self.config.max_seq_len,
-                self.config.embed_dim,
-                name="position_embedding"
-            )
+        # Positional embeddings
+        self.pos_embedding = RotaryPositionalEmbedding(
+            config.embed_dim,
+            config.max_seq_len,
+            dtype='float32'  # Keep positional embeddings in float32
+        )
         
         # Transformer blocks
         self.transformer_blocks = [
             TransformerBlock(
-                embed_dim=self.config.embed_dim,
-                num_heads=self.config.num_heads,
-                ffn_dim=self.config.ffn_dim,
-                dropout=self.config.dropout,
-                layer_norm_epsilon=self.config.layer_norm_epsilon,
-                max_seq_len=self.config.max_seq_len,
-                name=f"transformer_block_{i}"
+                config.embed_dim,
+                config.num_heads,
+                config.ffn_dim,
+                config.dropout,
+                use_custom_attention=config.use_custom_attention,
+                use_rotary_embeddings=config.use_rotary_embeddings,
+                layer_norm_epsilon=config.layer_norm_epsilon,
+                dtype='float32'  # Keep transformer blocks in float32
             )
-            for i in range(self.config.num_layers)
+            for _ in range(config.num_layers)
         ]
         
         # Final layer norm
         self.final_layer_norm = layers.LayerNormalization(
-            epsilon=self.config.layer_norm_epsilon,
-            name="final_layer_norm"
+            epsilon=config.layer_norm_epsilon,
+            dtype='float32'  # Keep layer norm in float32
         )
         
-        # Output projection
-        self.output_projection = layers.Dense(
-            self.config.vocab_size,
-            name="output_projection"
+        # Output layer
+        self.output_layer = layers.Dense(
+            config.vocab_size,
+            dtype='float32'  # Keep output layer in float32
         )
         
-    def call(self, inputs, training=False):
+        # Initialize tokenizer if transformers is available
+        try:
+            from transformers import GPT2Tokenizer
+            self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+        except ImportError:
+            self.tokenizer = None
+            logger.warning("Transformers library not available. Tokenizer not initialized.")
+    
+    def call(self, inputs, training=False, mask=None):
         """Forward pass of the model."""
-        if isinstance(inputs, dict):
-            input_ids = inputs['input_ids']
-        else:
-            input_ids = inputs
-            
+        # Convert inputs to float32 for embeddings
+        input_ids = tf.cast(inputs, tf.int32)
+        
         # Get sequence length
         seq_len = tf.shape(input_ids)[1]
         
-        # Get embeddings
-        token_embeddings = self.token_embedding(input_ids)
+        # Token embeddings
+        token_embeddings = self.token_embedding(input_ids)  # [batch_size, seq_len, embed_dim]
         
-        # Add positional embeddings
-        if self.config.use_rotary_embeddings:
-            token_embeddings = self.pos_embedding(token_embeddings)
-        else:
-            positions = tf.range(seq_len, dtype=tf.int32)
-            position_embeddings = self.pos_embedding(positions)
-            token_embeddings = token_embeddings + position_embeddings
+        # Apply positional embeddings
+        token_embeddings = self.pos_embedding(token_embeddings)
         
         # Apply transformer blocks
         x = token_embeddings
         for block in self.transformer_blocks:
-            x = block(x, training=training)
+            x = block(x, training=training, mask=mask)
         
         # Final layer norm
         x = self.final_layer_norm(x)
         
-        # Output projection
-        logits = self.output_projection(x)
+        # Output layer
+        logits = self.output_layer(x)
         
         return logits
         
@@ -654,21 +635,42 @@ class EnhancedMiniGPT(Model):
         
         return output_sequence
         
-    def generate_text(self, prompt: str, max_length: int = 100, temperature: float = 0.7):
-        """Generate text from a string prompt (requires tokenizer)"""
+    def generate_text(self, prompt: str, max_length: int = 512, batch_size: int = 8):
+        """Generate text from a prompt."""
         if self.tokenizer is None:
-            raise ValueError("Tokenizer not available. Please install transformers package.")
-            
-        # Tokenize input
+            raise ValueError("Tokenizer not initialized. Please install transformers library.")
+        
+        # Tokenize prompt
         input_ids = self.tokenizer.encode(prompt, return_tensors='tf')
+        input_ids = tf.cast(input_ids, tf.int32)
         
-        # Generate
-        output_ids = self.generate(input_ids, max_length=max_length, temperature=temperature)
+        # Generate tokens
+        for _ in range(max_length):
+            # Get model predictions
+            logits = self(input_ids, training=False)
+            
+            # Get next token probabilities
+            next_token_logits = logits[:, -1, :]
+            
+            # Apply temperature and sample
+            temperature = 0.7
+            next_token_logits = next_token_logits / temperature
+            next_token_probs = tf.nn.softmax(next_token_logits, axis=-1)
+            
+            # Sample next token
+            next_token = tf.random.categorical(next_token_probs, num_samples=1)
+            next_token = tf.cast(next_token, tf.int32)
+            
+            # Append to input_ids
+            input_ids = tf.concat([input_ids, next_token], axis=1)
+            
+            # Stop if we predict the end of sequence token
+            if next_token[0, 0] == self.tokenizer.eos_token_id:
+                break
         
-        # Decode output
-        output_text = self.tokenizer.decode(output_ids[0].numpy())
-        
-        return output_text
+        # Decode and return generated text
+        generated_text = self.tokenizer.decode(input_ids[0].numpy())
+        return generated_text
         
     def chat(self, message: str, max_length: int = 100, temperature: float = 0.7) -> str:
         """Chat with the model (requires tokenizer)"""

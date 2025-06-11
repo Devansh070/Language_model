@@ -21,13 +21,18 @@ from minigpt_transformer import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def create_dummy_dataset(vocab_size=50257, seq_len=512, batch_size=8, num_samples=1000):
-    """Create a dummy dataset for testing"""
+def create_dummy_dataset(vocab_size: int = 50257, seq_len: int = 128, batch_size: int = 2, num_samples: int = 1000):
+    """Create a dummy dataset for testing."""
     def data_generator():
         for _ in range(num_samples):
             # Generate random input sequence
-            input_seq = np.random.randint(0, vocab_size, size=seq_len, dtype=np.int32)
-            yield {'input_ids': input_seq}
+            input_ids = tf.random.uniform(
+                shape=(seq_len,),
+                minval=0,
+                maxval=vocab_size,
+                dtype=tf.int32
+            )
+            yield {'input_ids': input_ids}
     
     # Create dataset
     dataset = tf.data.Dataset.from_generator(
@@ -37,7 +42,10 @@ def create_dummy_dataset(vocab_size=50257, seq_len=512, batch_size=8, num_sample
         }
     )
     
-    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    # Batch the dataset
+    dataset = dataset.batch(batch_size)
+    
+    return dataset
 
 def create_text_dataset(text_file_path, tokenizer, seq_len=512, batch_size=8):
     """Create a dataset from a text file."""
@@ -228,48 +236,41 @@ def load_conversation_datasets():
     
     return all_texts
 
-def create_dataset_from_texts(texts, tokenizer, seq_len, batch_size):
+def create_dataset_from_texts(texts, tokenizer, seq_len: int = 128, batch_size: int = 2):
     """Create a TensorFlow dataset from a list of texts."""
     try:
         if not texts:
             logger.warning("No texts provided for dataset creation")
             return None
             
-        # Filter out non-string texts and empty strings
-        texts = [str(text).strip() for text in texts if text and str(text).strip()]
-        if not texts:
-            logger.warning("No valid texts after filtering")
-            return None
-            
-        # Create sequences
-        sequences = []
-        for text in texts:
-            try:
-                # Tokenize text
-                tokens = tokenizer.encode(text)
-                if not tokens or len(tokens) < 2:  # Need at least 2 tokens
+        def data_generator():
+            for text in texts:
+                if not isinstance(text, str):
                     continue
                     
-                # Create overlapping sequences of length seq_len
-                for i in range(0, len(tokens) - seq_len + 1, seq_len // 2):
-                    sequence = tokens[i:i + seq_len]
-                    if len(sequence) == seq_len:  # Only add complete sequences
-                        sequences.append(sequence)
-            except Exception as e:
-                logger.warning(f"Error processing text: {e}")
-                continue
+                try:
+                    # Tokenize text
+                    tokens = tokenizer.encode(text)
+                    
+                    # Create sequences with overlap
+                    for i in range(0, len(tokens) - seq_len + 1, seq_len // 2):
+                        sequence = tokens[i:i + seq_len]
+                        if len(sequence) == seq_len:
+                            yield {'input_ids': sequence}
+                except Exception as e:
+                    logger.warning(f"Error processing text: {e}")
+                    continue
         
-        if not sequences:
-            logger.warning("No valid sequences created from texts")
-            return None
-            
-        logger.info(f"Created {len(sequences)} sequences from {len(texts)} texts")
+        # Create dataset
+        dataset = tf.data.Dataset.from_generator(
+            data_generator,
+            output_signature={
+                'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
+            }
+        )
         
-        # Convert to TensorFlow dataset
-        dataset = tf.data.Dataset.from_tensor_slices(sequences)
-        dataset = dataset.map(lambda x: {'input_ids': x})
-        dataset = dataset.batch(batch_size)
-        dataset = dataset.prefetch(tf.data.AUTOTUNE)
+        # Batch and prefetch
+        dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
         
         return dataset
     except Exception as e:
@@ -278,14 +279,19 @@ def create_dataset_from_texts(texts, tokenizer, seq_len, batch_size):
 
 def train_model(model, config):
     """Train the model."""
-    # Create optimizer with gradient clipping
+    # Enable mixed precision
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
+    
+    # Create optimizer with mixed precision
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=config.learning_rate,
         beta_1=0.9,
         beta_2=0.999,
         epsilon=1e-8,
-        clipnorm=1.0  # Add gradient clipping
+        clipnorm=1.0
     )
+    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
     
     # Create metrics
     train_loss = tf.keras.metrics.Mean(name='train_loss')
@@ -296,73 +302,69 @@ def train_model(model, config):
     val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
     
     # Create loss function
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
     
-    # Define training step - Fixed shape handling
+    # Define training step
     @tf.function
-    def train_step(batch):
-        input_ids = batch['input_ids']
-        
-        # Create input and target sequences
-        inputs = input_ids[:, :-1]  # All tokens except the last one
-        targets = input_ids[:, 1:]  # All tokens except the first one
-        
+    def train_step(input_ids, labels):
         with tf.GradientTape() as tape:
             # Forward pass
-            logits = model(inputs, training=True)
+            logits = model(input_ids, training=True)
             
-            # Compute loss - ensure shapes match
-            batch_size = tf.shape(targets)[0]
-            seq_len = tf.shape(targets)[1]
-            
-            # Flatten targets for loss computation
-            targets_flat = tf.reshape(targets, [-1])
-            logits_flat = tf.reshape(logits, [-1, tf.shape(logits)[-1]])
+            # Ensure logits and labels have matching shapes
+            if logits.shape[0] != labels.shape[0]:
+                logger.warning(f"Shape mismatch: logits {logits.shape} vs labels {labels.shape}")
+                return 0.0
             
             # Compute loss
-            loss_per_token = loss_fn(targets_flat, logits_flat)
-            loss = tf.reduce_mean(loss_per_token)
+            loss = loss_fn(labels, logits)
             
             # Add regularization losses
-            if model.losses:
+            if hasattr(model, 'losses'):
                 loss += tf.reduce_sum(model.losses)
+            
+            # Scale loss for mixed precision
+            scaled_loss = optimizer.get_scaled_loss(loss)
         
         # Compute gradients
-        gradients = tape.gradient(loss, model.trainable_variables)
+        scaled_gradients = tape.gradient(scaled_loss, model.trainable_variables)
+        
+        # Check for NaN gradients
+        if any(tf.reduce_any(tf.math.is_nan(grad)) for grad in scaled_gradients if grad is not None):
+            logger.warning("NaN gradients detected, skipping this batch")
+            return loss
+        
+        # Unscale gradients
+        gradients = optimizer.get_unscaled_gradients(scaled_gradients)
         
         # Apply gradients
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         
         # Update metrics
         train_loss.update_state(loss)
-        train_perplexity.update_state(tf.exp(tf.minimum(loss, 10.0)))  # Cap to prevent overflow
-        train_accuracy.update_state(targets, logits)
+        train_perplexity.update_state(tf.exp(tf.minimum(loss, 10.0)))
+        train_accuracy.update_state(labels, logits)
         
         return loss
     
-    # Define validation step - Fixed shape handling
+    # Define validation step
     @tf.function
-    def val_step(batch):
-        input_ids = batch['input_ids']
-        
-        # Create input and target sequences
-        inputs = input_ids[:, :-1]
-        targets = input_ids[:, 1:]
-        
+    def val_step(input_ids, labels):
         # Forward pass
-        logits = model(inputs, training=False)
+        logits = model(input_ids, training=False)
+        
+        # Ensure logits and labels have matching shapes
+        if logits.shape[0] != labels.shape[0]:
+            logger.warning(f"Shape mismatch: logits {logits.shape} vs labels {labels.shape}")
+            return 0.0
         
         # Compute loss
-        targets_flat = tf.reshape(targets, [-1])
-        logits_flat = tf.reshape(logits, [-1, tf.shape(logits)[-1]])
-        
-        loss_per_token = loss_fn(targets_flat, logits_flat)
-        loss = tf.reduce_mean(loss_per_token)
+        loss = loss_fn(labels, logits)
         
         # Update metrics
         val_loss.update_state(loss)
         val_perplexity.update_state(tf.exp(tf.minimum(loss, 10.0)))
-        val_accuracy.update_state(targets, logits)
+        val_accuracy.update_state(labels, logits)
         
         return loss
     
@@ -381,45 +383,33 @@ def train_model(model, config):
     val_summary_writer = tf.summary.create_file_writer(val_log_dir)
     
     # Load datasets
-    logger.info("Loading conversation datasets...")
     texts = load_conversation_datasets()
     
     # Check if we have a tokenizer
     if not hasattr(model, 'tokenizer') or model.tokenizer is None:
         logger.warning("No tokenizer available, using dummy dataset")
-        train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
-        val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
+        train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, batch_size=2)
+        val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, batch_size=2)
     else:
         # Create datasets
-        if texts:
-            dataset = create_dataset_from_texts(texts, model.tokenizer, config.seq_len, config.batch_size)
-            if dataset is None:
-                logger.warning("Failed to create dataset from texts, using dummy dataset")
-                train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
-                val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
-            else:
-                # Split into train and validation
-                dataset_list = list(dataset)
-                total_size = len(dataset_list)
-                train_size = int(0.9 * total_size)
-                
-                train_dataset = tf.data.Dataset.from_tensor_slices(dataset_list[:train_size])
-                val_dataset = tf.data.Dataset.from_tensor_slices(dataset_list[train_size:])
-                
-                # Rebatch the datasets
-                train_dataset = train_dataset.unbatch().batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
-                val_dataset = val_dataset.unbatch().batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
+        dataset = create_dataset_from_texts(texts, model.tokenizer, config.seq_len, batch_size=2)
+        if dataset is None:
+            logger.warning("Failed to create dataset from texts, using dummy dataset")
+            train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, batch_size=2)
+            val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, batch_size=2)
         else:
-            logger.warning("No texts loaded, using dummy dataset")
-            train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
-            val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
+            # Split into train and validation
+            total_size = sum(1 for _ in dataset)
+            train_size = int(0.9 * total_size)
+            train_dataset = dataset.take(train_size)
+            val_dataset = dataset.skip(train_size)
     
     # Training loop
     num_epochs = 10
-    step_count = 0
     
     for epoch in range(num_epochs):
-        logger.info(f"Epoch {epoch + 1}/{num_epochs}")
+        logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
+        logger.info("=" * 50)
         
         # Reset metrics
         train_loss.reset_state()
@@ -440,25 +430,32 @@ def train_model(model, config):
                 if input_ids is None or tf.size(input_ids) == 0:
                     continue
                 
-                # Ensure input has enough tokens
-                if tf.shape(input_ids)[1] < 2:
+                # Ensure input_ids has correct shape
+                if len(input_ids.shape) != 2:
+                    logger.warning(f"Invalid input_ids shape: {input_ids.shape}")
                     continue
+                    
+                labels = input_ids[:, 1:]
                 
                 # Train step
-                loss = train_step(batch)
-                step_count += 1
+                loss = train_step(input_ids, labels)
                 batch_count += 1
                 
-                # Log progress every 100 batches
-                if batch_count % 100 == 0:
-                    logger.info(f"Epoch {epoch + 1}, Batch {batch_count}, Loss: {float(loss):.4f}")
-                    
+                # Log progress every 10 batches
+                if batch_count % 10 == 0:
+                    logger.info(
+                        f"Batch {batch_count} - "
+                        f"Loss: {loss:.4f}, "
+                        f"Perplexity: {tf.exp(tf.minimum(loss, 10.0)):.4f}, "
+                        f"Accuracy: {train_accuracy.result():.4f}"
+                    )
         except Exception as e:
             logger.error(f"Error during training: {e}")
             continue
         
         # Validation
         try:
+            val_batch_count = 0
             for val_batch in val_dataset:
                 if val_batch is None:
                     continue
@@ -467,11 +464,23 @@ def train_model(model, config):
                 if input_ids is None or tf.size(input_ids) == 0:
                     continue
                 
-                # Ensure input has enough tokens
-                if tf.shape(input_ids)[1] < 2:
+                # Ensure input_ids has correct shape
+                if len(input_ids.shape) != 2:
+                    logger.warning(f"Invalid input_ids shape: {input_ids.shape}")
                     continue
+                    
+                labels = input_ids[:, 1:]
+                val_step(input_ids, labels)
+                val_batch_count += 1
                 
-                val_step(val_batch)
+                # Log validation progress every 10 batches
+                if val_batch_count % 10 == 0:
+                    logger.info(
+                        f"Validation Batch {val_batch_count} - "
+                        f"Loss: {val_loss.result():.4f}, "
+                        f"Perplexity: {val_perplexity.result():.4f}, "
+                        f"Accuracy: {val_accuracy.result():.4f}"
+                    )
         except Exception as e:
             logger.error(f"Error during validation: {e}")
             continue
@@ -490,21 +499,25 @@ def train_model(model, config):
         except Exception as e:
             logger.error(f"Error logging metrics: {e}")
         
-        # Print metrics
+        # Print epoch summary
         try:
+            logger.info("\nEpoch Summary:")
+            logger.info("-" * 30)
             logger.info(
-                f"Epoch {epoch + 1} - "
-                f"Train Loss: {float(train_loss.result()):.4f}, "
-                f"Train Perplexity: {float(train_perplexity.result()):.4f}, "
-                f"Train Accuracy: {float(train_accuracy.result()):.4f}, "
-                f"Val Loss: {float(val_loss.result()):.4f}, "
-                f"Val Perplexity: {float(val_perplexity.result()):.4f}, "
-                f"Val Accuracy: {float(val_accuracy.result()):.4f}"
+                f"Training   - Loss: {train_loss.result():.4f}, "
+                f"Perplexity: {train_perplexity.result():.4f}, "
+                f"Accuracy: {train_accuracy.result():.4f}"
             )
+            logger.info(
+                f"Validation - Loss: {val_loss.result():.4f}, "
+                f"Perplexity: {val_perplexity.result():.4f}, "
+                f"Accuracy: {val_accuracy.result():.4f}"
+            )
+            logger.info("-" * 30)
         except Exception as e:
             logger.error(f"Error printing metrics: {e}")
         
-        # Save checkpoint every epoch
+        # Save checkpoint
         try:
             checkpoint.save(file_prefix=checkpoint_prefix)
             logger.info(f"Checkpoint saved for epoch {epoch + 1}")
@@ -513,9 +526,8 @@ def train_model(model, config):
     
     # Save final model
     try:
-        final_weights_path = './checkpoints/minigpt_final.weights.h5'
-        model.save_weights(final_weights_path)
-        logger.info(f"Training completed. Model saved to {final_weights_path}")
+        model.save_weights('./checkpoints/minigpt_final.weights.h5')
+        logger.info("Training completed. Model saved to ./checkpoints/minigpt_final.weights.h5")
     except Exception as e:
         logger.error(f"Error saving final model: {e}")
     
@@ -546,6 +558,10 @@ def chat_loop(model):
             print("\nAI: I apologize, but I encountered an error. Please try again.")
 
 if __name__ == "__main__":
+    # Enable mixed precision
+    policy = tf.keras.mixed_precision.Policy('mixed_float16')
+    tf.keras.mixed_precision.set_global_policy(policy)
+    
     # Create model configuration
     config = ModelConfig(
         vocab_size=50257,  # GPT-2 vocabulary size
