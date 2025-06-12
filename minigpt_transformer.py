@@ -108,6 +108,57 @@ class RotaryPositionalEmbedding(layers.Layer):
         sin = tf.cast(sin, tf.float16)
         cos = tf.cast(cos, tf.float16)
         
+        # Get input shape: [batch_size, seq_len, num_heads, head_dim]
+        x_shape = tf.shape(x)
+        batch_size = x_shape[0]
+        seq_len = x_shape[1]
+        num_heads = x_shape[2]
+        head_dim = x_shape[3]
+        
+        # sin and cos should have shape [seq_len, head_dim//2]
+        # We need to expand them to [1, seq_len, 1, head_dim//2] for broadcasting
+        sin = tf.expand_dims(tf.expand_dims(sin[:seq_len], 0), 2)  # [1, seq_len, 1, head_dim//2]
+        cos = tf.expand_dims(tf.expand_dims(cos[:seq_len], 0), 2)  # [1, seq_len, 1, head_dim//2]
+        
+        # Split x into two halves along the last dimension
+        x1, x2 = tf.split(x, 2, axis=-1)  # Each: [batch_size, seq_len, num_heads, head_dim//2]
+        x1 = tf.cast(x1, tf.float16)
+        x2 = tf.cast(x2, tf.float16)
+        
+        # Apply rotation with proper broadcasting
+        rotated_x1 = tf.cast(cos * x1 - sin * x2, dtype=tf.float16)
+        rotated_x2 = tf.cast(sin * x1 + cos * x2, dtype=tf.float16)
+        
+        return tf.concat([rotated_x1, rotated_x2], axis=-1)
+    
+    def call(self, x, seq_len=None):
+        """Apply rotary positional embeddings."""
+        x = tf.cast(x, tf.float16)
+        
+        if seq_len is None:
+            seq_len = tf.shape(x)[1]
+        
+        sin = tf.cast(self.sin_vals[:seq_len], tf.float16)
+        cos = tf.cast(self.cos_vals[:seq_len], tf.float16)
+        
+        return self._apply_rotary_pos_emb(x, sin, cos)
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'dim': self.dim,
+            'max_seq_len': self.max_seq_len,
+            'dtype': self.dtype
+        })
+        return config
+    
+    def _apply_rotary_pos_emb(self, x, sin, cos):
+        """Apply rotary positional embeddings with float16 support."""
+        # Ensure inputs are float16
+        x = tf.cast(x, tf.float16)
+        sin = tf.cast(sin, tf.float16)
+        cos = tf.cast(cos, tf.float16)
+        
         x_shape = tf.shape(x)
         seq_len = x_shape[1]
         
