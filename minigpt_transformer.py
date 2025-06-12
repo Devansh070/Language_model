@@ -517,18 +517,7 @@ class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
         })
         return config
 
-
-
-
-
-
-
-
-
-
-
-
-]    'TransformerBlock'    'FeedForward',    'RotaryPositionalEmbedding',    'MultiHeadAttention',    'CustomMultiHeadAttention',    'EnhancedMiniGPT',    'ModelConfig',__all__ = [# Export all necessary classes# Export all necessary classes
+# Export all necessary classes
 __all__ = [
     'ModelConfig',
     'EnhancedMiniGPT',
