@@ -2,22 +2,30 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Union
 import os
 import logging
 import time
 
+# Configure logging first
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # Optional: only import if transformers is available
 try:
-    from transformers import AutoTokenizer
+    from transformers import GPT2Tokenizer as _GPT2Tokenizer
+    from transformers import AutoTokenizer as _AutoTokenizer
+    GPT2TokenizerClass = _GPT2Tokenizer
     HAS_TRANSFORMERS = True
+    logger.info("Successfully imported transformers library")
 except ImportError:
-    print("Warning: transformers library not found. Tokenizer features will be disabled.")
+    logger.warning("transformers library not found. Tokenizer features will be disabled.")
     HAS_TRANSFORMERS = False
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+    GPT2Tokenizer = None
+    AutoTokenizer = None
 
 @dataclass
 class ModelConfig:
@@ -35,7 +43,7 @@ class ModelConfig:
         use_custom_attention: bool = True,
         use_rotary_embeddings: bool = True,
         learning_rate: float = 1e-4,
-        batch_size: int = 8,
+        batch_size: int = 1,  # Changed from 8 to 1 to match example input
         seq_len: int = 1024
     ):
         self.vocab_size = vocab_size
@@ -118,7 +126,7 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
         key_dim: int,
         use_rotary_embeddings: bool = True,
         dropout: float = 0.1,
-        name: str = None,
+        name: Optional[str] = "custom_attention",  # Provide default name
         **kwargs
     ):
         # Remove custom arguments from kwargs before passing to parent
@@ -345,17 +353,9 @@ class TransformerBlock(tf.keras.layers.Layer):
         dropout_rate: float = 0.1,
         use_custom_attention: bool = True,
         use_rotary_embeddings: bool = True,
-        name: str = None,
+        name: Optional[str] = "transformer_block",  # Provide default name
         **kwargs
     ):
-        # Remove custom arguments from kwargs before passing to parent
-        custom_kwargs = {
-            'use_custom_attention': use_custom_attention,
-            'use_rotary_embeddings': use_rotary_embeddings
-        }
-        for key in custom_kwargs:
-            kwargs.pop(key, None)
-            
         super().__init__(name=name, **kwargs)
         
         self.embed_dim = embed_dim
@@ -365,44 +365,51 @@ class TransformerBlock(tf.keras.layers.Layer):
         self.use_custom_attention = use_custom_attention
         self.use_rotary_embeddings = use_rotary_embeddings
         
-        # Create layers
+        # Create attention layer
         if use_custom_attention:
             self.attention = CustomMultiHeadAttention(
                 num_heads=num_heads,
                 key_dim=embed_dim // num_heads,
-                use_rotary_embeddings=use_rotary_embeddings
+                use_rotary_embeddings=use_rotary_embeddings,
+                dropout=dropout_rate
             )
         else:
-            self.attention = tf.keras.layers.MultiHeadAttention(
+            self.attention = MultiHeadAttention(
+                embed_dim=embed_dim,
                 num_heads=num_heads,
-                key_dim=embed_dim // num_heads
+                dropout=dropout_rate,
+                max_seq_len=2048,
+                use_custom_attention=False
             )
-            
-        self.ffn = tf.keras.Sequential([
-            tf.keras.layers.Dense(ff_dim, activation='gelu'),
-            tf.keras.layers.Dense(embed_dim)
-        ])
         
-        self.layernorm1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.layernorm2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        # Feed-forward network
+        self.ffn = FeedForward(
+            embed_dim=embed_dim,
+            ffn_dim=ff_dim,
+            dropout=dropout_rate
+        )
+        
+        # Layer normalization
+        self.ln1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.ln2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        
+        # Dropout
         self.dropout1 = tf.keras.layers.Dropout(dropout_rate)
         self.dropout2 = tf.keras.layers.Dropout(dropout_rate)
+    
+    def call(self, inputs, training=False):
+        # Self-attention and residual connection
+        attn_output = self.attention(inputs, training=training)
+        attn_output = self.dropout1(attn_output, training=training)
+        out1 = self.ln1(inputs + attn_output)
         
-    def call(self, inputs, mask=None, training=False):
-        # Apply attention
-        attention_output = self.attention(
-            inputs, inputs,
-            attention_mask=mask,
-            training=training
-        )
-        attention_output = self.dropout1(attention_output, training=training)
-        out1 = self.layernorm1(inputs + attention_output)
-        
-        # Apply feed-forward network
-        ffn_output = self.ffn(out1)
+        # Feed-forward network and residual connection
+        ffn_output = self.ffn(out1, training=training)
         ffn_output = self.dropout2(ffn_output, training=training)
-        return self.layernorm2(out1 + ffn_output)
+        out2 = self.ln2(out1 + ffn_output)
         
+        return out2
+    
     def get_config(self):
         config = super().get_config()
         config.update({
@@ -413,282 +420,99 @@ class TransformerBlock(tf.keras.layers.Layer):
             'use_custom_attention': self.use_custom_attention,
             'use_rotary_embeddings': self.use_rotary_embeddings
         })
-        # Multi-head attention with RoPE
-        self.attention = MultiHeadAttention(
-            embed_dim=self.embed_dim,
-            num_heads=self.num_heads,
-            dropout=self.dropout_rate,
-            max_seq_len=2048,
-            use_custom_attention=self.use_custom_attention,
-            name='attention'
-        )
-        
-        # Feed-forward network
-        self.ffn = FeedForward(
-            embed_dim=self.embed_dim,
-            ffn_dim=self.ff_dim,
-            dropout=self.dropout_rate,
-            name='ffn'
-        )
-        
-        # Layer normalization
-        self.ln1 = layers.LayerNormalization(epsilon=1e-6, name='ln1')
-        self.ln2 = layers.LayerNormalization(epsilon=1e-6, name='ln2')
-        
-        # Dropout
-        self.dropout = layers.Dropout(self.dropout_rate)
-        
         return config
 
-class EnhancedMiniGPT(tf.keras.Model):
-    """Enhanced MiniGPT model with improved architecture and features."""
+class MiniGPT(Model):
+    """MiniGPT model based on the Transformer architecture."""
     
     def __init__(self, config: ModelConfig, **kwargs):
-        super().__init__(name="enhanced_minigpt", **kwargs)
-        self.config = config
-        self.batch_size = 2  # Set default batch size to 2
+        super().__init__(**kwargs)
         
-        # Token and positional embeddings
-        self.token_embedding = tf.keras.layers.Embedding(
-            config.vocab_size,
-            config.embed_dim,
-            name="token_embedding"
-        )
-        self.position_embedding = tf.keras.layers.Embedding(
-            config.max_seq_len,
-            config.embed_dim,
-            name="position_embedding"
-        )
+        self.config = config
+        
+        # Embeddings
+        self.token_emb = layers.Embedding(config.vocab_size, config.embed_dim, name="token_emb")
+        self.pos_emb = RotaryPositionalEmbedding(config.embed_dim, config.max_seq_len, name="pos_emb")
         
         # Transformer blocks
-        self.transformer_blocks = []
-        for i in range(config.num_layers):
-            block = TransformerBlock(
+        self.transformer_blocks = [
+            TransformerBlock(
                 embed_dim=config.embed_dim,
                 num_heads=config.num_heads,
                 ff_dim=config.ffn_dim,
                 dropout_rate=config.dropout,
-                use_custom_attention=True,
-                use_rotary_embeddings=True,
+                use_custom_attention=config.use_custom_attention,
+                use_rotary_embeddings=config.use_rotary_embeddings,
                 name=f"transformer_block_{i}"
             )
-            self.transformer_blocks.append(block)
+            for i in range(config.num_layers)
+        ]
         
-        # Output layers
-        self.layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.output_layer = tf.keras.layers.Dense(
-            config.vocab_size,
-            name="output_layer"
-        )
+        # Layer normalization
+        self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_epsilon, name="ln_f")
         
-        # Initialize tokenizer if available
-        try:
-            from transformers import GPT2Tokenizer
-            self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-        except ImportError:
-            logger.warning("transformers library not available, tokenizer not initialized")
-            self.tokenizer = None
+        # Output head (token prediction)
+        self.head = layers.Dense(config.vocab_size, name="head")
+        
+        # Initialize tokenizer if transformers is available
+        self.tokenizer = None
+        if HAS_TRANSFORMERS and GPT2TokenizerClass is not None:
+            try:
+                self.tokenizer = GPT2TokenizerClass.from_pretrained('gpt2')
+                if self.tokenizer is not None:
+                    logger.info("Successfully initialized GPT2Tokenizer")
+                else:
+                    logger.warning("Tokenizer initialization returned None")
+            except Exception as e:
+                logger.warning(f"Failed to initialize tokenizer: {str(e)}")
+                self.tokenizer = None
+        else:
+            logger.warning("Transformers library not available, tokenizer not initialized")
     
     def call(self, inputs, training=False, mask=None):
-        # Get input shape and ensure batch size is 2
-        batch_size = tf.shape(inputs)[0]
-        if batch_size != 2:
-            logger.warning(f"Expected batch size 2, got {batch_size}. Adjusting input.")
-            inputs = tf.slice(inputs, [0, 0], [2, -1])
-            batch_size = 2
-            
-        seq_len = tf.shape(inputs)[1]
+        # Validate input shape
+        input_shape = tf.shape(inputs)
+        tf.debugging.assert_rank(inputs, 2, message="Input must be rank 2: [batch_size, seq_len]")
+        tf.debugging.assert_less_equal(
+            input_shape[1], 
+            self.config.max_seq_len,
+            message=f"Input sequence length must be <= {self.config.max_seq_len}"
+        )
         
-        # Create position indices
-        positions = tf.range(0, seq_len, dtype=tf.int32)
-        positions = tf.expand_dims(positions, 0)
-        positions = tf.tile(positions, [batch_size, 1])
+        # Get batch size and sequence length
+        batch_size = input_shape[0]
+        seq_len = input_shape[1]
         
-        # Get embeddings
-        token_embeddings = self.token_embedding(inputs)
-        position_embeddings = self.position_embedding(positions)
+        # Token embeddings
+        x = self.token_emb(inputs)  # [batch_size, seq_len, embed_dim]
         
-        # Combine embeddings
-        x = token_embeddings + position_embeddings
+        # Positional embeddings
+        x = self.pos_emb(x, seq_len)  # [batch_size, seq_len, embed_dim]
         
-        # Apply transformer blocks
+        # Transformer blocks
         for block in self.transformer_blocks:
-            x = block(x, mask=mask, training=training)
+            x = block(x, training=training)  # [batch_size, seq_len, embed_dim]
         
-        # Final layer norm and output
-        x = self.layernorm(x)
-        logits = self.output_layer(x)
+        # Layer normalization
+        x = self.ln_f(x)  # [batch_size, seq_len, embed_dim]
+        
+        # Output logits
+        logits = self.head(x)  # [batch_size, seq_len, vocab_size]
         
         return logits
-    
-    def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7,
-                top_k: int = 50, top_p: float = 0.9, batch_size: int = 2):
-        """Generate text using the model."""
-        if self.tokenizer is None:
-            raise ValueError("Tokenizer not initialized")
-            
-        # Ensure batch size is 2
-        if batch_size != 2:
-            logger.warning(f"Adjusting batch size from {batch_size} to 2")
-            batch_size = 2
-            
-        # Initialize generation
-        generated = tf.identity(input_ids)
-        current_length = tf.shape(input_ids)[1]
-        
-        # Generate tokens
-        for _ in range(max_length - current_length):
-            # Get model predictions
-            logits = self(generated, training=False)
-            next_token_logits = logits[:, -1, :] / temperature
-            
-            # Apply top-k filtering
-            if top_k > 0:
-                indices_to_remove = next_token_logits < tf.math.top_k(next_token_logits, top_k)[0][..., -1, None]
-                next_token_logits = tf.where(indices_to_remove, tf.ones_like(next_token_logits) * -float('inf'), next_token_logits)
-            
-            # Apply top-p (nucleus) filtering
-            if top_p < 1.0:
-                sorted_logits = tf.sort(next_token_logits, direction='DESCENDING')
-                sorted_indices = tf.argsort(next_token_logits, direction='DESCENDING')
-                cumulative_probs = tf.cumsum(tf.nn.softmax(sorted_logits, axis=-1), axis=-1)
-                
-                # Remove tokens with cumulative probability above the threshold
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove = tf.concat([tf.zeros_like(sorted_indices_to_remove[:, :1]), sorted_indices_to_remove[:, :-1]], axis=-1)
-                indices_to_remove = tf.batch_gather(sorted_indices_to_remove, sorted_indices)
-                next_token_logits = tf.where(indices_to_remove, tf.ones_like(next_token_logits) * -float('inf'), next_token_logits)
-            
-            # Sample next token
-            probs = tf.nn.softmax(next_token_logits, axis=-1)
-            next_token = tf.random.categorical(probs, num_samples=1)
-            
-            # Append to generated sequence
-            generated = tf.concat([generated, next_token], axis=1)
-            
-            # Check for end of sequence token
-            if tf.reduce_any(next_token == self.tokenizer.eos_token_id):
-                break
-        
-        return generated
     
     def get_config(self):
         config = super().get_config()
         config.update({
-            'config': self.config,
-            'batch_size': self.batch_size
+            'vocab_size': self.config.vocab_size,
+            'max_seq_len': self.config.max_seq_len,
+            'embed_dim': self.config.embed_dim,
+            'num_heads': self.config.num_heads,
+            'num_layers': self.config.num_layers,
+            'ffn_dim': self.config.ffn_dim,
+            'dropout': self.config.dropout,
+            'layer_norm_epsilon': self.config.layer_norm_epsilon,
+            'use_custom_attention': self.config.use_custom_attention,
+            'use_rotary_embeddings': self.config.use_rotary_embeddings
         })
         return config
-
-    def generate_text(self, prompt: str, max_length: int = 512, batch_size: int = 8):
-        """Generate text from a prompt."""
-        if self.tokenizer is None:
-            raise ValueError("Tokenizer not initialized. Please install transformers library.")
-        
-        # Tokenize prompt
-        input_ids = self.tokenizer.encode(prompt, return_tensors='tf')
-        input_ids = tf.cast(input_ids, tf.int32)
-        
-        # Generate tokens
-        for _ in range(max_length):
-            # Get model predictions
-            logits = self(input_ids, training=False)
-            
-            # Get next token probabilities
-            next_token_logits = logits[:, -1, :]
-            
-            # Apply temperature and sample
-            temperature = 0.7
-            next_token_logits = next_token_logits / temperature
-            next_token_probs = tf.nn.softmax(next_token_logits, axis=-1)
-            
-            # Sample next token
-            next_token = tf.random.categorical(next_token_probs, num_samples=1)
-            next_token = tf.cast(next_token, tf.int32)
-            
-            # Append to input_ids
-            input_ids = tf.concat([input_ids, next_token], axis=1)
-            
-            # Stop if we predict the end of sequence token
-            if next_token[0, 0] == self.tokenizer.eos_token_id:
-                break
-        
-        # Decode and return generated text
-        generated_text = self.tokenizer.decode(input_ids[0].numpy())
-        return generated_text
-        
-    def chat(self, message: str, max_length: int = 100, temperature: float = 0.7) -> str:
-        """Chat with the model (requires tokenizer)"""
-        if self.tokenizer is None:
-            raise ValueError("Tokenizer not available. Please install transformers package.")
-            
-        # Format message
-        prompt = f"Human: {message}\nAI:"
-        
-        # Generate response
-        response = self.generate_text(prompt, max_length=max_length, temperature=temperature)
-        
-        # Extract AI response
-        try:
-            response = response.split("AI:")[-1].strip()
-        except:
-            response = response.strip()
-            
-        return response
-        
-    def compute_loss(self, input_ids, labels=None):
-        """Compute the loss for training."""
-        if labels is None:
-            labels = input_ids[:, 1:]
-            input_ids = input_ids[:, :-1]
-            
-        # Get model predictions
-        logits = self(input_ids, training=True)
-        
-        # Compute loss
-        loss = tf.keras.losses.sparse_categorical_crossentropy(
-            labels, logits, from_logits=True
-        )
-        
-        return tf.reduce_mean(loss)
-
-    def benchmark_speed(self, batch_sizes=[1, 2, 4, 8], seq_lengths=[128, 256, 512]) -> Dict:
-        """Benchmark model speed with different batch sizes and sequence lengths."""
-        results = {}
-        
-        for batch_size in batch_sizes:
-            for seq_len in seq_lengths:
-                key = f"batch_{batch_size}_seq_{seq_len}"
-                
-                # Create dummy input
-                input_ids = tf.random.uniform(
-                    (batch_size, seq_len),
-                    minval=0,
-                    maxval=self.config.vocab_size,
-                    dtype=tf.int32
-                )
-                
-                # Warmup
-                for _ in range(3):
-                    _ = self(input_ids, training=False)
-                
-                # Benchmark
-                num_runs = 10
-                start_time = time.time()
-                
-                for _ in range(num_runs):
-                    _ = self(input_ids, training=False)
-                
-                elapsed = time.time() - start_time
-                
-                # Calculate metrics
-                tokens_per_second = (batch_size * seq_len * num_runs) / elapsed
-                
-                results[key] = {
-                    "tokens_per_second": tokens_per_second,
-                    "batch_size": batch_size,
-                    "seq_len": seq_len,
-                    "elapsed_time": elapsed
-                }
-        
-        return results
