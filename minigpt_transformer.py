@@ -1,13 +1,10 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
-import numpy as np
-from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict, Union
-import os
-import logging
-import time
+
+# Set mixed precision policy
 policy = tf.keras.mixed_precision.Policy('mixed_float16')
 tf.keras.mixed_precision.set_global_policy(policy)
+
 # Configure logging first
 logging.basicConfig(
     level=logging.INFO,
@@ -65,67 +62,72 @@ class RotaryPositionalEmbedding(layers.Layer):
     """Rotary Positional Embedding layer with float16 support."""
     
     def __init__(self, dim, max_seq_len=1024, dtype=tf.float16, **kwargs):
-        # Pass dtype to parent class instead of setting it directly
         super().__init__(dtype=dtype, **kwargs)
         self.dim = dim
         self.max_seq_len = max_seq_len
         
-        # Create position indices using self.dtype from parent
-        position = tf.range(max_seq_len, dtype=self.dtype)
-        div_term = tf.exp(
-            tf.range(0, dim, 2, dtype=self.dtype) * 
-            -(tf.math.log(10000.0) / dim)
+        # Ensure all constants are float16
+        position = tf.cast(tf.range(max_seq_len), dtype=tf.float16)
+        div_term_exp = tf.cast(
+            tf.range(0, dim, 2), 
+            dtype=tf.float16
+        ) * tf.cast(-tf.math.log(10000.0) / dim, dtype=tf.float16)
+        
+        # Calculate div_term in float16
+        div_term = tf.cast(tf.exp(div_term_exp), dtype=tf.float16)
+        
+        # Ensure position multiplication is in float16
+        pos_expanded = tf.expand_dims(position, 1)
+        div_term_expanded = tf.expand_dims(div_term, 0)
+        pos = tf.cast(
+            pos_expanded * div_term_expanded,
+            dtype=tf.float16
         )
         
-        # Calculate sin and cos values using self.dtype
-        pos = tf.cast(
-            tf.expand_dims(position, 1) * tf.expand_dims(div_term, 0),
-            dtype=self.dtype
-        )
-        self.sin_vals = tf.cast(tf.sin(pos), dtype=self.dtype)
-        self.cos_vals = tf.cast(tf.cos(pos), dtype=self.dtype)
+        # Store sin and cos values in float16
+        self.sin_vals = tf.cast(tf.sin(pos), dtype=tf.float16)
+        self.cos_vals = tf.cast(tf.cos(pos), dtype=tf.float16)
     
     def _apply_rotary_pos_emb(self, x, sin, cos):
         """Apply rotary positional embeddings with float16 support."""
-        # Ensure all inputs are float16
-        x = tf.cast(x, self.dtype)
-        sin = tf.cast(sin, self.dtype)
-        cos = tf.cast(cos, self.dtype)
+        # Ensure inputs are float16
+        x = tf.cast(x, tf.float16)
+        sin = tf.cast(sin, tf.float16)
+        cos = tf.cast(cos, tf.float16)
         
-        # Reshape for broadcasting
         x_shape = tf.shape(x)
         seq_len = x_shape[1]
         
-        # Reshape sin and cos for broadcasting (maintaining float16)
-        sin = tf.cast(tf.expand_dims(sin[:seq_len], 0), self.dtype)
-        cos = tf.cast(tf.expand_dims(cos[:seq_len], 0), self.dtype)
-        
-        # Split input into real and imaginary parts
-        x1, x2 = tf.split(x, 2, axis=-1)
-        
-        # Apply rotary embeddings (all operations in float16)
-        rotated_x1 = cos * x1 - sin * x2
-        rotated_x2 = sin * x1 + cos * x2
-        
-        # Concatenate and ensure output is float16
-        return tf.cast(
-            tf.concat([rotated_x1, rotated_x2], axis=-1),
-            self.dtype
+        # Ensure broadcasting shapes are float16
+        sin = tf.cast(
+            tf.expand_dims(sin[:seq_len], 0),
+            dtype=tf.float16
         )
+        cos = tf.cast(
+            tf.expand_dims(cos[:seq_len], 0),
+            dtype=tf.float16
+        )
+        
+        # Split and rotate in float16
+        x1, x2 = tf.split(x, 2, axis=-1)
+        x1 = tf.cast(x1, tf.float16)
+        x2 = tf.cast(x2, tf.float16)
+        
+        rotated_x1 = tf.cast(cos * x1 - sin * x2, dtype=tf.float16)
+        rotated_x2 = tf.cast(sin * x1 + cos * x2, dtype=tf.float16)
+        
+        return tf.concat([rotated_x1, rotated_x2], axis=-1)
     
     def call(self, x, seq_len=None):
-        """Apply rotary positional embeddings with float16 support."""
-        # Ensure input is float16
-        x = tf.cast(x, self.dtype)
+        """Apply rotary positional embeddings."""
+        x = tf.cast(x, tf.float16)
         
         if seq_len is None:
             seq_len = tf.shape(x)[1]
         
-        # Get sin and cos values for the sequence length (already float16)
-        sin = self.sin_vals[:seq_len]
-        cos = self.cos_vals[:seq_len]
+        sin = tf.cast(self.sin_vals[:seq_len], tf.float16)
+        cos = tf.cast(self.cos_vals[:seq_len], tf.float16)
         
-        # Apply rotary embeddings (maintaining float16)
         return self._apply_rotary_pos_emb(x, sin, cos)
     
     def get_config(self):
@@ -241,7 +243,7 @@ class MultiHeadAttention(layers.Layer):
     """Multi-head attention layer with custom attention implementation"""
     
     def __init__(self, embed_dim, num_heads, dropout=0.1, max_seq_len=2048, use_custom_attention=True, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(dtype=tf.float16, **kwargs)  # Set layer dtype
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout_rate = dropout
@@ -250,14 +252,12 @@ class MultiHeadAttention(layers.Layer):
         assert embed_dim % num_heads == 0
         self.head_dim = embed_dim // num_heads
         
-        # Query, Key, Value projections
-        self.query_proj = layers.Dense(embed_dim, name='query_proj')
-        self.key_proj = layers.Dense(embed_dim, name='key_proj')
-        self.value_proj = layers.Dense(embed_dim, name='value_proj')
-        
-        # Output projection
-        self.output_proj = layers.Dense(embed_dim, name='output_proj')
-        
+        # Query, Key, Value projections with float16
+        self.query_proj = create_dense_float16(embed_dim, name='query_proj')
+        self.key_proj = create_dense_float16(embed_dim, name='key_proj')
+        self.value_proj = create_dense_float16(embed_dim, name='value_proj')
+        self.output_proj = create_dense_float16(embed_dim, name='output_proj')
+
         # Rotary position embedding
         self.rope = RotaryPositionalEmbedding(
             dim=self.head_dim,
@@ -306,9 +306,12 @@ class MultiHeadAttention(layers.Layer):
             k = tf.transpose(k, perm=[0, 2, 1, 3])
             v = tf.transpose(v, perm=[0, 2, 1, 3])
             
-            # Create causal mask
+            # Create causal mask and cast to float16
             mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
-            mask = tf.where(mask == 0, -1e9, 0.0)
+            mask = tf.cast(
+                tf.where(mask == 0, -1e9, 0.0),
+                dtype=tf.float16
+            )
             mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)  # [1, 1, seq_len, seq_len]
             
             # Standard attention
@@ -325,19 +328,23 @@ class MultiHeadAttention(layers.Layer):
     
     def _scaled_dot_product_attention(self, q, k, v, mask=None, training=False):
         """Standard scaled dot-product attention (fallback)"""
+        # Cast all inputs to float16
+        q = tf.cast(q, tf.float16)
+        k = tf.cast(k, tf.float16)
+        v = tf.cast(v, tf.float16)
+
         # Compute attention scores
         scores = tf.matmul(q, k, transpose_b=True)
-        scores = scores / tf.sqrt(tf.cast(self.head_dim, tf.float32))
+        scores = scores / tf.math.sqrt(tf.cast(self.head_dim, tf.float16))
         
         # Apply mask if provided
         if mask is not None:
+            mask = tf.cast(mask, tf.float16)
             scores += mask
         
         # Apply softmax
         attention_weights = tf.nn.softmax(scores, axis=-1)
-        
-        # Apply dropout
-        attention_weights = self.dropout(attention_weights, training=training)
+        attention_weights = tf.cast(attention_weights, tf.float16)
         
         # Apply attention to values
         output = tf.matmul(attention_weights, v)
@@ -348,12 +355,11 @@ class FeedForward(layers.Layer):
     """Feed-forward network"""
     
     def __init__(self, embed_dim, ffn_dim, dropout=0.1, **kwargs):
-        super().__init__(**kwargs)
-        self.embed_dim = embed_dim
-        self.ffn_dim = ffn_dim
+        super().__init__(dtype=tf.float16, **kwargs)
+        self.dense1 = create_dense_float16(ffn_dim, activation='gelu', name='dense1')
+        self.dense2 = create_dense_float16(embed_dim, name='dense2')
         
-        self.dense1 = layers.Dense(ffn_dim, activation='gelu', name='dense1')
-        self.dense2 = layers.Dense(embed_dim, name='dense2')
+        # Dropout
         self.dropout = layers.Dropout(dropout)
         
     def call(self, x, training=False):
@@ -376,7 +382,7 @@ class TransformerBlock(tf.keras.layers.Layer):
         name: Optional[str] = "transformer_block",  # Provide default name
         **kwargs
     ):
-        super().__init__(name=name, **kwargs)
+        super().__init__(name=name, dtype=tf.float16, **kwargs)
         
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -410,8 +416,8 @@ class TransformerBlock(tf.keras.layers.Layer):
         )
         
         # Layer normalization
-        self.ln1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.ln2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.ln1 = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=tf.float16)
+        self.ln2 = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=tf.float16)
         
         # Dropout
         self.dropout1 = tf.keras.layers.Dropout(dropout_rate)
@@ -446,12 +452,17 @@ class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
     """Enhanced implementation of MiniGPT with additional features."""
     
     def __init__(self, config: ModelConfig, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(dtype=tf.float16, **kwargs)
         
         self.config = config
         
         # Embeddings
-        self.token_emb = layers.Embedding(config.vocab_size, config.embed_dim, name="token_emb")
+        self.token_emb = layers.Embedding(
+            config.vocab_size, 
+            config.embed_dim,
+            dtype=tf.float16,
+            name="token_emb"
+        )
         self.pos_emb = RotaryPositionalEmbedding(config.embed_dim, config.max_seq_len, name="pos_emb")
         
         # Transformer blocks
@@ -472,8 +483,8 @@ class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
         self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_epsilon, name="ln_f")
         
         # Output head (token prediction)
-        self.head = layers.Dense(config.vocab_size, name="head")
-        
+        self.head = create_dense_float16(config.vocab_size, name="head")
+    
         # Initialize tokenizer if transformers is available
         self.tokenizer = None
         if HAS_TRANSFORMERS and GPT2TokenizerClass is not None:
@@ -490,6 +501,9 @@ class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
             logger.warning("Transformers library not available, tokenizer not initialized")
     
     def call(self, inputs, training=False, mask=None):
+        # Cast inputs to float16
+        inputs = tf.cast(inputs, tf.float16)
+        
         # Validate input shape
         input_shape = tf.shape(inputs)
         tf.debugging.assert_rank(inputs, 2, message="Input must be rank 2: [batch_size, seq_len]")
