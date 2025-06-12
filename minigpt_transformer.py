@@ -422,8 +422,8 @@ class TransformerBlock(tf.keras.layers.Layer):
         })
         return config
 
-class MiniGPT(Model):
-    """MiniGPT model based on the Transformer architecture."""
+class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
+    """Enhanced implementation of MiniGPT with additional features."""
     
     def __init__(self, config: ModelConfig, **kwargs):
         super().__init__(**kwargs)
@@ -516,3 +516,25 @@ class MiniGPT(Model):
             'use_rotary_embeddings': self.config.use_rotary_embeddings
         })
         return config
+
+
+
+
+
+
+
+
+
+
+
+
+]    'TransformerBlock'    'FeedForward',    'RotaryPositionalEmbedding',    'MultiHeadAttention',    'CustomMultiHeadAttention',    'EnhancedMiniGPT',    'ModelConfig',__all__ = [# Export all necessary classes# Export all necessary classes
+__all__ = [
+    'ModelConfig',
+    'EnhancedMiniGPT',
+    'CustomMultiHeadAttention',
+    'MultiHeadAttention',
+    'RotaryPositionalEmbedding',
+    'FeedForward',
+    'TransformerBlock'
+]
