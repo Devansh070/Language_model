@@ -28,6 +28,16 @@ except ImportError:
     GPT2Tokenizer = None
     AutoTokenizer = None
 
+def create_dense_float16(units, activation=None, name=None, **kwargs):
+    """Helper function to create Dense layers with float16 dtype."""
+    return tf.keras.layers.Dense(
+        units=units,
+        activation=activation,
+        dtype=tf.float16,
+        name=name,
+        **kwargs
+    )
+
 @dataclass
 class ModelConfig:
     """Configuration for the MiniGPT model."""
@@ -161,7 +171,7 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
         for key in custom_kwargs:
             kwargs.pop(key, None)
             
-        super().__init__(name=name, **kwargs)
+        super().__init__(name=name, dtype=tf.float16, **kwargs)
         
         self.num_heads = num_heads
         self.key_dim = key_dim
@@ -169,12 +179,12 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
         self.dropout = dropout
         
         # Create query, key, value projection layers
-        self.query_dense = tf.keras.layers.Dense(num_heads * key_dim)
-        self.key_dense = tf.keras.layers.Dense(num_heads * key_dim)
-        self.value_dense = tf.keras.layers.Dense(num_heads * key_dim)
+        self.query_dense = create_dense_float16(num_heads * key_dim, name='query_dense')
+        self.key_dense = create_dense_float16(num_heads * key_dim, name='key_dense')
+        self.value_dense = create_dense_float16(num_heads * key_dim, name='value_dense')
         
         # Create output projection layer
-        self.output_dense = tf.keras.layers.Dense(num_heads * key_dim)
+        self.output_dense = create_dense_float16(num_heads * key_dim, name='output_dense')
         
         # Create dropout layer
         self.dropout_layer = tf.keras.layers.Dropout(dropout)
@@ -184,6 +194,9 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
             self.rotary_embeddings = RotaryPositionalEmbedding(key_dim)
     
     def call(self, inputs, attention_mask=None, training=False):
+        # Ensure inputs are float16
+        inputs = tf.cast(inputs, tf.float16)
+        
         # Get input shape
         batch_size = tf.shape(inputs)[0]
         seq_len = tf.shape(inputs)[1]
@@ -192,6 +205,11 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
         q = self.query_dense(inputs)  # [batch_size, seq_len, num_heads * key_dim]
         k = self.key_dense(inputs)    # [batch_size, seq_len, num_heads * key_dim]
         v = self.value_dense(inputs)  # [batch_size, seq_len, num_heads * key_dim]
+        
+        # Cast to float16
+        q = tf.cast(q, tf.float16)
+        k = tf.cast(k, tf.float16)
+        v = tf.cast(v, tf.float16)
         
         # Reshape for multi-head attention
         q = tf.reshape(q, [batch_size, seq_len, self.num_heads, self.key_dim])
@@ -210,18 +228,29 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
         
         # Compute attention scores
         scores = tf.matmul(q, k, transpose_b=True)  # [batch_size, num_heads, seq_len, seq_len]
-        scores = scores / tf.math.sqrt(tf.cast(self.key_dim, scores.dtype))
+        scores = tf.cast(scores, tf.float16)
+        scores = scores / tf.math.sqrt(tf.cast(self.key_dim, tf.float16))
+        
+        # Create causal mask if not provided
+        if attention_mask is None:
+            mask = tf.linalg.band_part(tf.ones((seq_len, seq_len), dtype=tf.float16), -1, 0)
+            mask = tf.where(mask == 0, -1e4, 0.0)  # Use -1e4 instead of -1e9 for float16
+            mask = tf.cast(mask, tf.float16)
+            attention_mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)
         
         # Apply attention mask if provided
         if attention_mask is not None:
+            attention_mask = tf.cast(attention_mask, tf.float16)
             scores = scores + attention_mask
         
         # Apply softmax to get attention weights
         attention_weights = tf.nn.softmax(scores, axis=-1)
+        attention_weights = tf.cast(attention_weights, tf.float16)
         attention_weights = self.dropout_layer(attention_weights, training=training)
         
         # Apply attention weights to values
         context = tf.matmul(attention_weights, v)  # [batch_size, num_heads, seq_len, key_dim]
+        context = tf.cast(context, tf.float16)
         
         # Transpose and reshape for output
         context = tf.transpose(context, [0, 2, 1, 3])  # [batch_size, seq_len, num_heads, key_dim]
@@ -229,6 +258,7 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
         
         # Project to output
         output = self.output_dense(context)
+        output = tf.cast(output, tf.float16)
         
         return output
     
@@ -281,19 +311,26 @@ class MultiHeadAttention(layers.Layer):
         self.dropout = layers.Dropout(dropout)
         
     def call(self, x, training=False):
+        # Ensure x is float16
+        x = tf.cast(x, tf.float16)
         batch_size = tf.shape(x)[0]
         seq_len = tf.shape(x)[1]
         
         if self.use_custom_attention:
-            # Use custom attention - simplified mask creation
-            attention = self.custom_attention(x, use_causal_mask=True, training=training)
-            return attention
+            # Use custom attention
+            attention = self.custom_attention(x, training=training)
+            return tf.cast(attention, tf.float16)
         else:
             # Standard attention with RoPE
             # Get Q, K, V
             q = self.query_proj(x)
             k = self.key_proj(x)
             v = self.value_proj(x)
+            
+            # Cast to float16
+            q = tf.cast(q, tf.float16)
+            k = tf.cast(k, tf.float16)
+            v = tf.cast(v, tf.float16)
             
             # Reshape for multi-head attention
             q = tf.reshape(q, (batch_size, seq_len, self.num_heads, self.head_dim))
@@ -310,9 +347,9 @@ class MultiHeadAttention(layers.Layer):
             v = tf.transpose(v, perm=[0, 2, 1, 3])
             
             # Create causal mask and cast to float16
-            mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
+            mask = tf.linalg.band_part(tf.ones((seq_len, seq_len), dtype=tf.float16), -1, 0)
             mask = tf.cast(
-                tf.where(mask == 0, -1e9, 0.0),
+                tf.where(mask == 0, -1e4, 0.0),  # Use -1e4 instead of -1e9 for float16
                 dtype=tf.float16
             )
             mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)  # [1, 1, seq_len, seq_len]
@@ -327,7 +364,7 @@ class MultiHeadAttention(layers.Layer):
             # Output projection
             output = self.output_proj(attention)
             
-            return output
+            return tf.cast(output, tf.float16)
     
     def _scaled_dot_product_attention(self, q, k, v, mask=None, training=False):
         """Standard scaled dot-product attention (fallback)"""
@@ -338,6 +375,7 @@ class MultiHeadAttention(layers.Layer):
 
         # Compute attention scores
         scores = tf.matmul(q, k, transpose_b=True)
+        scores = tf.cast(scores, tf.float16)
         scores = scores / tf.math.sqrt(tf.cast(self.head_dim, tf.float16))
         
         # Apply mask if provided
@@ -352,7 +390,7 @@ class MultiHeadAttention(layers.Layer):
         # Apply attention to values
         output = tf.matmul(attention_weights, v)
         
-        return output
+        return tf.cast(output, tf.float16)
 
 class FeedForward(layers.Layer):
     """Feed-forward network"""
@@ -366,10 +404,14 @@ class FeedForward(layers.Layer):
         self.dropout = layers.Dropout(dropout)
         
     def call(self, x, training=False):
+        # Ensure x is float16
+        x = tf.cast(x, tf.float16)
+        
         x = self.dense1(x)
+        x = tf.cast(x, tf.float16)
         x = self.dropout(x, training=training)
         x = self.dense2(x)
-        return x
+        return tf.cast(x, tf.float16)
 
 class TransformerBlock(tf.keras.layers.Layer):
     """Transformer block with optional custom attention and rotary embeddings."""
@@ -418,7 +460,7 @@ class TransformerBlock(tf.keras.layers.Layer):
             dropout=dropout_rate
         )
         
-        # Layer normalization
+        # Layer normalization with float16
         self.ln1 = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=tf.float16)
         self.ln2 = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=tf.float16)
         
@@ -427,15 +469,22 @@ class TransformerBlock(tf.keras.layers.Layer):
         self.dropout2 = tf.keras.layers.Dropout(dropout_rate)
     
     def call(self, inputs, training=False):
+        # Ensure inputs are float16
+        inputs = tf.cast(inputs, tf.float16)
+        
         # Self-attention and residual connection
         attn_output = self.attention(inputs, training=training)
+        attn_output = tf.cast(attn_output, tf.float16)
         attn_output = self.dropout1(attn_output, training=training)
         out1 = self.ln1(inputs + attn_output)
+        out1 = tf.cast(out1, tf.float16)
         
         # Feed-forward network and residual connection
         ffn_output = self.ffn(out1, training=training)
+        ffn_output = tf.cast(ffn_output, tf.float16)
         ffn_output = self.dropout2(ffn_output, training=training)
         out2 = self.ln2(out1 + ffn_output)
+        out2 = tf.cast(out2, tf.float16)
         
         return out2
     
@@ -459,7 +508,7 @@ class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
         
         self.config = config
         
-        # Embeddings
+        # Embeddings with float16
         self.token_emb = layers.Embedding(
             config.vocab_size, 
             config.embed_dim,
@@ -482,10 +531,14 @@ class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
             for i in range(config.num_layers)
         ]
         
-        # Layer normalization
-        self.ln_f = layers.LayerNormalization(epsilon=config.layer_norm_epsilon, name="ln_f")
+        # Layer normalization with float16
+        self.ln_f = layers.LayerNormalization(
+            epsilon=config.layer_norm_epsilon, 
+            dtype=tf.float16,
+            name="ln_f"
+        )
         
-        # Output head (token prediction)
+        # Output head (token prediction) with float16
         self.head = create_dense_float16(config.vocab_size, name="head")
     
         # Initialize tokenizer if transformers is available
@@ -504,8 +557,8 @@ class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
             logger.warning("Transformers library not available, tokenizer not initialized")
     
     def call(self, inputs, training=False, mask=None):
-        # Cast inputs to float16
-        inputs = tf.cast(inputs, tf.float16)
+        # Cast inputs to int32 for embedding lookup (tokens should be integers)
+        inputs = tf.cast(inputs, tf.int32)
         
         # Validate input shape
         input_shape = tf.shape(inputs)
@@ -520,21 +573,26 @@ class EnhancedMiniGPT(Model):  # Changed from MiniGPT to EnhancedMiniGPT
         batch_size = input_shape[0]
         seq_len = input_shape[1]
         
-        # Token embeddings
+        # Token embeddings (this will output float16 due to embedding layer dtype)
         x = self.token_emb(inputs)  # [batch_size, seq_len, embed_dim]
+        x = tf.cast(x, tf.float16)  # Ensure float16
         
         # Positional embeddings
         x = self.pos_emb(x, seq_len)  # [batch_size, seq_len, embed_dim]
+        x = tf.cast(x, tf.float16)  # Ensure float16
         
         # Transformer blocks
         for block in self.transformer_blocks:
             x = block(x, training=training)  # [batch_size, seq_len, embed_dim]
+            x = tf.cast(x, tf.float16)  # Ensure float16
         
         # Layer normalization
         x = self.ln_f(x)  # [batch_size, seq_len, embed_dim]
+        x = tf.cast(x, tf.float16)  # Ensure float16
         
-        # Output logits
+        # Output logits (cast to float32 for numerical stability in loss computation)
         logits = self.head(x)  # [batch_size, seq_len, vocab_size]
+        logits = tf.cast(logits, tf.float32)  # Cast to float32 for loss computation
         
         return logits
     
@@ -562,5 +620,6 @@ __all__ = [
     'MultiHeadAttention',
     'RotaryPositionalEmbedding',
     'FeedForward',
-    'TransformerBlock'
+    'TransformerBlock',
+    'create_dense_float16'
 ]
