@@ -65,19 +65,19 @@ class RotaryPositionalEmbedding(layers.Layer):
     """Rotary Positional Embedding layer with float16 support."""
     
     def __init__(self, dim, max_seq_len=1024, dtype=tf.float16, **kwargs):
-        super().__init__(**kwargs)
+        # Pass dtype to parent class instead of setting it directly
+        super().__init__(dtype=dtype, **kwargs)
         self.dim = dim
         self.max_seq_len = max_seq_len
-        self.dtype = dtype
         
-        # Create position indices with float16
+        # Create position indices using self.dtype from parent
         position = tf.range(max_seq_len, dtype=self.dtype)
         div_term = tf.exp(
             tf.range(0, dim, 2, dtype=self.dtype) * 
             -(tf.math.log(10000.0) / dim)
         )
         
-        # Calculate sin and cos values in float16
+        # Calculate sin and cos values using self.dtype
         pos = tf.cast(
             tf.expand_dims(position, 1) * tf.expand_dims(div_term, 0),
             dtype=self.dtype
