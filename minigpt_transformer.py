@@ -6,7 +6,8 @@ from typing import Optional, List, Tuple, Dict, Union
 import os
 import logging
 import time
-
+policy = tf.keras.mixed_precision.Policy('mixed_float16')
+tf.keras.mixed_precision.set_global_policy(policy)
 # Configure logging first
 logging.basicConfig(
     level=logging.INFO,
@@ -61,59 +62,78 @@ class ModelConfig:
         self.seq_len = seq_len
 
 class RotaryPositionalEmbedding(layers.Layer):
-    """Rotary Positional Embedding layer."""
-    def __init__(self, dim, max_seq_len=1024, **kwargs):
+    """Rotary Positional Embedding layer with float16 support."""
+    
+    def __init__(self, dim, max_seq_len=1024, dtype=tf.float16, **kwargs):
         super().__init__(**kwargs)
         self.dim = dim
         self.max_seq_len = max_seq_len
+        self.dtype = dtype
         
-        # Create position indices
-        position = tf.range(max_seq_len, dtype=tf.float32)
-        div_term = tf.exp(tf.range(0, dim, 2, dtype=tf.float32) * -(tf.math.log(10000.0) / dim))
+        # Create position indices with float16
+        position = tf.range(max_seq_len, dtype=self.dtype)
+        div_term = tf.exp(
+            tf.range(0, dim, 2, dtype=self.dtype) * 
+            -(tf.math.log(10000.0) / dim)
+        )
         
-        # Calculate sin and cos values
-        pos = tf.expand_dims(position, 1) * tf.expand_dims(div_term, 0)
-        self.sin_vals = tf.sin(pos)
-        self.cos_vals = tf.cos(pos)
+        # Calculate sin and cos values in float16
+        pos = tf.cast(
+            tf.expand_dims(position, 1) * tf.expand_dims(div_term, 0),
+            dtype=self.dtype
+        )
+        self.sin_vals = tf.cast(tf.sin(pos), dtype=self.dtype)
+        self.cos_vals = tf.cast(tf.cos(pos), dtype=self.dtype)
     
     def _apply_rotary_pos_emb(self, x, sin, cos):
-        """Apply rotary positional embeddings to input tensor."""
-        # Reshape input for broadcasting
+        """Apply rotary positional embeddings with float16 support."""
+        # Ensure all inputs are float16
+        x = tf.cast(x, self.dtype)
+        sin = tf.cast(sin, self.dtype)
+        cos = tf.cast(cos, self.dtype)
+        
+        # Reshape for broadcasting
         x_shape = tf.shape(x)
-        batch_size = x_shape[0]
         seq_len = x_shape[1]
         
-        # Reshape sin and cos for broadcasting
-        sin = tf.expand_dims(sin[:seq_len], 0)  # [1, seq_len, dim/2]
-        cos = tf.expand_dims(cos[:seq_len], 0)  # [1, seq_len, dim/2]
+        # Reshape sin and cos for broadcasting (maintaining float16)
+        sin = tf.cast(tf.expand_dims(sin[:seq_len], 0), self.dtype)
+        cos = tf.cast(tf.expand_dims(cos[:seq_len], 0), self.dtype)
         
         # Split input into real and imaginary parts
         x1, x2 = tf.split(x, 2, axis=-1)
         
-        # Apply rotary embeddings
+        # Apply rotary embeddings (all operations in float16)
         rotated_x1 = cos * x1 - sin * x2
         rotated_x2 = sin * x1 + cos * x2
         
-        # Concatenate rotated parts
-        return tf.concat([rotated_x1, rotated_x2], axis=-1)
+        # Concatenate and ensure output is float16
+        return tf.cast(
+            tf.concat([rotated_x1, rotated_x2], axis=-1),
+            self.dtype
+        )
     
     def call(self, x, seq_len=None):
-        """Apply rotary positional embeddings."""
+        """Apply rotary positional embeddings with float16 support."""
+        # Ensure input is float16
+        x = tf.cast(x, self.dtype)
+        
         if seq_len is None:
             seq_len = tf.shape(x)[1]
         
-        # Get sin and cos values for the sequence length
+        # Get sin and cos values for the sequence length (already float16)
         sin = self.sin_vals[:seq_len]
         cos = self.cos_vals[:seq_len]
         
-        # Apply rotary embeddings
+        # Apply rotary embeddings (maintaining float16)
         return self._apply_rotary_pos_emb(x, sin, cos)
     
     def get_config(self):
         config = super().get_config()
         config.update({
             'dim': self.dim,
-            'max_seq_len': self.max_seq_len
+            'max_seq_len': self.max_seq_len,
+            'dtype': self.dtype
         })
         return config
 
