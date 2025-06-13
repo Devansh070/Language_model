@@ -35,7 +35,7 @@ class ModelConfig:
         use_custom_attention: bool = True,
         use_rotary_embeddings: bool = True,
         learning_rate: float = 1e-4,
-        batch_size: int = 1,  # Changed from 8 to 1
+        batch_size: int = 8,
         seq_len: int = 1024
     ):
         self.vocab_size = vocab_size
