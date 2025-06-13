@@ -38,7 +38,6 @@ def create_dense_float16(units, activation=None, name=None, **kwargs):
         **kwargs
     )
 
-@dataclass
 class ModelConfig:
     """Configuration for the MiniGPT model."""
     def __init__(
