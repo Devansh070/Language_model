@@ -174,12 +174,12 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
         self.dropout = dropout
         
         # Create projection layers - let mixed precision handle dtype
-        self.query_dense = layers.Dense(num_heads * key_dim, name='query_dense')
-        self.key_dense = layers.Dense(num_heads * key_dim, name='key_dense')
-        self.value_dense = layers.Dense(num_heads * key_dim, name='value_dense')
-        self.output_dense = layers.Dense(num_heads * key_dim, name='output_dense')
+        self.query_dense = layers.Dense(num_heads * key_dim, dtype=tf.float16, name='query_dense')
+        self.key_dense = layers.Dense(num_heads * key_dim, dtype=tf.float16, name='key_dense')
+        self.value_dense = layers.Dense(num_heads * key_dim, dtype=tf.float16, name='value_dense')
+        self.output_dense = layers.Dense(num_heads * key_dim, dtype=tf.float16, name='output_dense')
         
-        self.dropout_layer = tf.keras.layers.Dropout(dropout)
+        self.dropout_layer = tf.keras.layers.Dropout(dropout, dtype=tf.float16)
         
         # Create rotary embeddings
         if use_rotary_embeddings:
@@ -218,18 +218,25 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
         q = tf.transpose(q, [0, 2, 1, 3])  # [batch, heads, seq_len, key_dim]
         k = tf.transpose(k, [0, 2, 1, 3])
         v = tf.transpose(v, [0, 2, 1, 3])
+
+        q = tf.cast(self.query_dense(inputs), tf.float16)
+        k = tf.cast(self.key_dense(inputs), tf.float16)
+        v = tf.cast(self.value_dense(inputs), tf.float16)
         
         # Scaled dot-product attention
         scores = tf.matmul(q, k, transpose_b=True)
         scores = scores * self.scale
         
-        # Create or apply attention mask
+        # Create or apply attention mask - FIX: Ensure dtype consistency
         if attention_mask is None:
-            # Create causal mask - use safe values for float16
+            # Create causal mask with proper dtype (float16 to match scores)
             mask = tf.linalg.band_part(tf.ones([seq_len, seq_len], dtype=tf.float16), -1, 0)
-            # Use -10000.0 instead of -65504.0 to be safer
-            mask = tf.where(mask == 0, -10000.0, 0.0)
+            # Use -10000.0 and cast to float16
+            mask = tf.where(mask == 0, tf.cast(-10000.0, tf.float16), tf.cast(0.0, tf.float16))
             attention_mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)
+        else:
+            # Ensure provided mask has correct dtype
+            attention_mask = tf.cast(attention_mask, tf.float16)
         
         scores = scores + attention_mask
         
@@ -257,7 +264,7 @@ class CustomMultiHeadAttention(tf.keras.layers.Layer):
             'dropout': self.dropout
         })
         return config
-
+    
 def safe_cast_float16(tensor, name=None):
     """Safely cast tensor to float16 with overflow protection."""
     with tf.name_scope(name or 'safe_cast_float16'):
@@ -301,7 +308,8 @@ class MultiHeadAttention(layers.Layer):
             )
         
         # Dropout
-        self.dropout = layers.Dropout(dropout)
+        self.dropout = layers.Dropout(dropout, dtype=tf.float16)
+
         
     def call(self, x, training=False):
         batch_size = tf.shape(x)[0]
@@ -331,6 +339,10 @@ class MultiHeadAttention(layers.Layer):
             q = tf.transpose(q, perm=[0, 2, 1, 3])
             k = tf.transpose(k, perm=[0, 2, 1, 3])
             v = tf.transpose(v, perm=[0, 2, 1, 3])
+
+            q = tf.cast(self.query_proj(x), tf.float16)
+            k = tf.cast(self.key_proj(x), tf.float16)
+            v = tf.cast(self.value_proj(x), tf.float16)
             
             # Create causal mask - use safer values
             mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
@@ -373,17 +385,19 @@ class FeedForward(layers.Layer):
     def __init__(self, embed_dim, ffn_dim, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
         # Let mixed precision policy handle dtype automatically
-        self.dense1 = layers.Dense(ffn_dim, activation='gelu', name='dense1')
-        self.dense2 = layers.Dense(embed_dim, name='dense2')
+        self.dense1 = layers.Dense(ffn_dim, activation='gelu', dtype=tf.float16, name='dense1')
+        self.dense2 = layers.Dense(embed_dim, dtype=tf.float16, name='dense2')
+
         
         # Dropout
-        self.dropout = layers.Dropout(dropout)
-        
+        self.dropout = layers.Dropout(dropout, dtype=tf.float16)
+ 
     def call(self, x, training=False):
-        x = self.dense1(x)
+        x = tf.cast(x, tf.float16)
+        x = self.dense1(x)  # GELU activation
         x = self.dropout(x, training=training)
         x = self.dense2(x)
-        return x
+        return tf.cast(x, tf.float16)
 
 class TransformerBlock(tf.keras.layers.Layer):
     """Transformer block with improved float16 handling."""
@@ -433,23 +447,32 @@ class TransformerBlock(tf.keras.layers.Layer):
         )
         
         # Layer normalization - let mixed precision handle dtype
-        self.ln1 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
-        self.ln2 = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+        self.ln1 = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=tf.float16)
+        self.ln2 = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=tf.float16)
         
         # Dropout
-        self.dropout1 = tf.keras.layers.Dropout(dropout_rate)
-        self.dropout2 = tf.keras.layers.Dropout(dropout_rate)
+        self.dropout1 = tf.keras.layers.Dropout(dropout_rate, dtype=tf.float16)
+        self.dropout2 = tf.keras.layers.Dropout(dropout_rate, dtype=tf.float16)
     
     def call(self, inputs, training=False):
+        # Ensure inputs are float16
+        inputs = tf.cast(inputs, tf.float16)
+        
         # Self-attention and residual connection
         attn_output = self.attention(inputs, training=training)
+        attn_output = tf.cast(attn_output, tf.float16)  # Ensure float16
         attn_output = self.dropout1(attn_output, training=training)
-        out1 = self.ln1(inputs + attn_output)
         
-        # Feed-forward network and residual connection
+        # Residual connection with matching dtypes
+        out1 = self.ln1(tf.cast(inputs, tf.float16) + tf.cast(attn_output, tf.float16))
+        
+        # Feed-forward network and residual connection  
         ffn_output = self.ffn(out1, training=training)
+        ffn_output = tf.cast(ffn_output, tf.float16)  # Ensure float16
         ffn_output = self.dropout2(ffn_output, training=training)
-        out2 = self.ln2(out1 + ffn_output)
+        
+        # Residual connection with matching dtypes
+        out2 = self.ln2(tf.cast(out1, tf.float16) + tf.cast(ffn_output, tf.float16))
         
         return out2
     
@@ -477,6 +500,7 @@ class EnhancedMiniGPT(Model):
         self.token_emb = layers.Embedding(
             config.vocab_size, 
             config.embed_dim,
+            dtype=tf.float16,
             name="token_emb"
         )
         
@@ -484,6 +508,7 @@ class EnhancedMiniGPT(Model):
         self.pos_emb = layers.Embedding(
             config.max_seq_len,
             config.embed_dim,
+            dtype=tf.float16,
             name="pos_emb"
         )
         
@@ -503,7 +528,8 @@ class EnhancedMiniGPT(Model):
         
         # Layer normalization
         self.ln_f = layers.LayerNormalization(
-            epsilon=config.layer_norm_epsilon,
+            epsilon=config.layer_norm_epsilon, 
+            dtype=tf.float16,  # Explicit dtype
             name="ln_f"
         )
         
@@ -529,40 +555,29 @@ class EnhancedMiniGPT(Model):
         # Cast inputs to int32 for embedding lookup
         inputs = tf.cast(inputs, tf.int32)
         
-        # Validate input shape
-        input_shape = tf.shape(inputs)
-        tf.debugging.assert_rank(inputs, 2, message="Input must be rank 2: [batch_size, seq_len]")
-        tf.debugging.assert_less_equal(
-            input_shape[1], 
-            self.config.max_seq_len,
-            message=f"Input sequence length must be <= {self.config.max_seq_len}"
-        )
-        
-        # Get batch size and sequence length
-        batch_size = input_shape[0]
-        seq_len = input_shape[1]
-        
-        # Token embeddings
+        # Get embeddings
         x = self.token_emb(inputs)  # [batch_size, seq_len, embed_dim]
         
         # Positional embeddings
-        positions = tf.range(seq_len, dtype=tf.int32)
-        positions = tf.expand_dims(positions, 0)  # [1, seq_len]
-        positions = tf.tile(positions, [batch_size, 1])  # [batch_size, seq_len]
-        pos_emb = self.pos_emb(positions)  # [batch_size, seq_len, embed_dim]
+        positions = tf.range(tf.shape(inputs)[1], dtype=tf.int32)
+        positions = tf.expand_dims(positions, 0)
+        positions = tf.tile(positions, [tf.shape(inputs)[0], 1])
+        pos_emb = self.pos_emb(positions)
         
-        # Add token and positional embeddings
-        x = x + pos_emb
+        # CRITICAL: Ensure both embeddings are float16 before addition
+        x = tf.cast(x, tf.float16) + tf.cast(pos_emb, tf.float16)
         
-        # Transformer blocks
+        # Transformer blocks - ensure float16 throughout
         for block in self.transformer_blocks:
-            x = block(x, training=training)  # [batch_size, seq_len, embed_dim]
+            x = block(tf.cast(x, tf.float16), training=training)
+            x = tf.cast(x, tf.float16)  # Ensure output is float16
         
         # Layer normalization
-        x = self.ln_f(x)  # [batch_size, seq_len, embed_dim]
+        x = self.ln_f(tf.cast(x, tf.float16))
         
-        # Output logits (head layer already has float32 dtype)
-        logits = self.head(x)  # [batch_size, seq_len, vocab_size]
+        # CRITICAL: Cast to float32 for output head
+        x_float32 = tf.cast(x, tf.float32)
+        logits = self.head(x_float32)
         
         return logits
     
