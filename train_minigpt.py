@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 import datasets
 from datasets import disable_caching
+import time
+from tqdm import tqdm
 from minigpt_transformer import (
     EnhancedMiniGPT,
     ModelConfig,
@@ -20,6 +22,33 @@ from minigpt_transformer import (
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+class TrainingMetrics:
+    """Class to track and display training metrics."""
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        self.losses = []
+        self.accuracies = []
+        self.perplexities = []
+        self.start_time = time.time()
+    
+    def update(self, loss, accuracy):
+        self.losses.append(loss)
+        self.accuracies.append(accuracy)
+        perplexity = np.exp(min(loss, 10))  # Cap to prevent overflow
+        self.perplexities.append(perplexity)
+    
+    def get_averages(self):
+        if not self.losses:
+            return 0.0, 0.0, 0.0
+        return np.mean(self.losses), np.mean(self.accuracies), np.mean(self.perplexities)
+    
+    def get_current(self):
+        if not self.losses:
+            return 0.0, 0.0, 0.0
+        return self.losses[-1], self.accuracies[-1], self.perplexities[-1]
 
 def create_dummy_dataset(vocab_size: int = 50257, seq_len: int = 128, batch_size: int = 2, num_samples: int = 1000):
     """Create a dummy dataset for testing with proper batching and infinite repeat."""
@@ -79,7 +108,7 @@ def create_text_dataset(texts, tokenizer, seq_len=512, batch_size=8):
         return None
 
 def load_conversation_datasets():
-    """Load conversation datasets with proper cache clearing and error handling."""
+    """Load conversation datasets with improved error handling and fallback strategies."""
     # Clear cache directory and disable caching completely
     try:
         import shutil
@@ -99,116 +128,108 @@ def load_conversation_datasets():
     os.environ['HF_DATASETS_OFFLINE'] = '0'
     os.environ['HF_DATASETS_CACHE'] = '/tmp/hf_cache'
     
+    # Simplified dataset configs with better fallback
     dataset_configs = [
         ("blended_skill_talk", "dialog"),
         ("daily_dialog", "dialogue")
     ]
     
     all_texts = []
-    max_texts = 10000
+    max_texts = 5000  # Reduced for faster loading
     
     for dataset_name, field_name in dataset_configs:
         try:
             logger.info(f"Attempting to load {dataset_name}...")
             
-            # Try multiple loading strategies
+            # Try the most reliable loading strategy first
             dataset = None
             
-            # Strategy 1: Force redownload with no verification
             try:
+                # Strategy 1: Simple load with minimal configuration
                 dataset = datasets.load_dataset(
-                    dataset_name, 
-                    split="train[:1000]",
-                    verification_mode="no_checks",
-                    download_mode="force_redownload",
-                    cache_dir=None,
-                    keep_in_memory=True
+                    dataset_name,
+                    split="train",
+                    trust_remote_code=True,
+                    verification_mode="no_checks"
                 )
-                logger.info(f"Successfully loaded {dataset_name} with force redownload")
-            except Exception as e1:
-                logger.warning(f"Strategy 1 failed for {dataset_name}: {e1}")
                 
-                # Strategy 2: Try without specifying split size
+                # Take only first 1000 samples to avoid memory issues
+                if len(dataset) > 1000:
+                    dataset = dataset.select(range(1000))
+                    
+                logger.info(f"Successfully loaded {dataset_name} with simple strategy")
+                
+            except Exception as e1:
+                logger.warning(f"Simple strategy failed for {dataset_name}: {e1}")
+                
+                # Strategy 2: Try with different split configurations
                 try:
+                    # Try different split names
+                    possible_splits = ['train', 'training', 'dialogue']
                     full_dataset = datasets.load_dataset(
                         dataset_name,
-                        verification_mode="no_checks",
-                        download_mode="force_redownload",
-                        cache_dir=None,
-                        keep_in_memory=True
+                        trust_remote_code=True,
+                        verification_mode="no_checks"
                     )
-                    # Take first 1000 samples manually
-                    if hasattr(full_dataset, 'train') and full_dataset.train:
-                        dataset = full_dataset.train.select(range(min(1000, len(full_dataset.train))))
-                    elif hasattr(full_dataset, 'training') and full_dataset.training:
-                        dataset = full_dataset.training.select(range(min(1000, len(full_dataset.training))))
-                    else:
+                    
+                    dataset = None
+                    for split_name in possible_splits:
+                        if hasattr(full_dataset, split_name):
+                            split_data = getattr(full_dataset, split_name)
+                            if split_data is not None:
+                                dataset = split_data.select(range(min(1000, len(split_data))))
+                                logger.info(f"Successfully loaded {dataset_name} using split '{split_name}'")
+                                break
+                    
+                    if dataset is None:
                         # Try to get any available split
                         available_splits = list(full_dataset.keys()) if hasattr(full_dataset, 'keys') else []
                         if available_splits:
                             first_split = full_dataset[available_splits[0]]
                             dataset = first_split.select(range(min(1000, len(first_split))))
+                            logger.info(f"Successfully loaded {dataset_name} using first available split")
                     
-                    if dataset:
-                        logger.info(f"Successfully loaded {dataset_name} with manual split selection")
                 except Exception as e2:
-                    logger.warning(f"Strategy 2 failed for {dataset_name}: {e2}")
-                    
-                    # Strategy 3: Try streaming mode
-                    try:
-                        streaming_dataset = datasets.load_dataset(
-                            dataset_name,
-                            streaming=True,
-                            verification_mode="no_checks"
-                        )
-                        
-                        # Convert streaming to regular dataset with limited samples
-                        samples = []
-                        if hasattr(streaming_dataset, 'train'):
-                            train_stream = streaming_dataset.train
-                        elif hasattr(streaming_dataset, 'training'):
-                            train_stream = streaming_dataset.training
-                        else:
-                            available_splits = list(streaming_dataset.keys())
-                            train_stream = streaming_dataset[available_splits[0]] if available_splits else None
-                        
-                        if train_stream:
-                            for i, example in enumerate(train_stream):
-                                if i >= 1000:
-                                    break
-                                samples.append(example)
-                            
-                            if samples:
-                                dataset = datasets.Dataset.from_list(samples)
-                                logger.info(f"Successfully loaded {dataset_name} with streaming mode")
-                    except Exception as e3:
-                        logger.warning(f"Strategy 3 failed for {dataset_name}: {e3}")
-                        continue
+                    logger.warning(f"Split strategy failed for {dataset_name}: {e2}")
+                    continue
             
             # Process the dataset if we successfully loaded it
             if dataset is not None:
                 try:
+                    logger.info(f"Processing {len(dataset)} examples from {dataset_name}")
+                    
                     # Extract text based on dataset structure
-                    for example in dataset:
+                    for i, example in enumerate(dataset):
+                        if i % 100 == 0:
+                            logger.info(f"Processing example {i}/{len(dataset)} from {dataset_name}")
+                            
                         text_content = None
                         
                         # Try different field access patterns
-                        if field_name in example and isinstance(example[field_name], list):
-                            text_content = " ".join([str(turn) for turn in example[field_name]])
-                        elif field_name in example and isinstance(example[field_name], str):
-                            text_content = example[field_name]
+                        if field_name in example:
+                            if isinstance(example[field_name], list):
+                                # Handle list of dialogue turns
+                                text_content = " ".join([str(turn) for turn in example[field_name] if turn])
+                            elif isinstance(example[field_name], str):
+                                text_content = example[field_name]
                         elif 'text' in example:
                             text_content = example['text']
                         elif 'conversation' in example:
                             if isinstance(example['conversation'], list):
-                                text_content = " ".join([str(turn) for turn in example['conversation']])
+                                text_content = " ".join([str(turn) for turn in example['conversation'] if turn])
                             else:
                                 text_content = str(example['conversation'])
+                        elif 'utterances' in example:
+                            if isinstance(example['utterances'], list):
+                                text_content = " ".join([str(utt) for utt in example['utterances'] if utt])
                         
-                        if text_content and len(text_content.strip()) > 10:
-                            all_texts.append(text_content.strip())
-                            if len(all_texts) >= max_texts:
-                                break
+                        # Clean and validate text
+                        if text_content:
+                            text_content = text_content.strip()
+                            if len(text_content) > 20:  # Minimum length requirement
+                                all_texts.append(text_content)
+                                if len(all_texts) >= max_texts:
+                                    break
                     
                     logger.info(f"Successfully extracted {len(all_texts)} texts from {dataset_name}")
                     
@@ -222,38 +243,47 @@ def load_conversation_datasets():
             logger.warning(f"Failed to load {dataset_name}: {e}")
             continue
     
-    # Add comprehensive fallback data if no texts were loaded
-    if not all_texts:
-        logger.warning("No texts loaded from datasets, using comprehensive fallback data")
+    # Add comprehensive fallback data if insufficient texts were loaded
+    if len(all_texts) < 100:
+        logger.warning(f"Only {len(all_texts)} texts loaded from datasets, adding fallback data")
         fallback_texts = [
-            "Hello, how are you today? I'm doing well, thank you for asking.",
-            "What's your favorite color? I like blue because it reminds me of the sky.",
-            "Do you enjoy reading books? Yes, I love reading science fiction and fantasy.",
-            "What do you think about artificial intelligence? It's a fascinating field with lots of potential.",
-            "How do you spend your free time? I enjoy hiking, reading, and learning new things.",
-            "Tell me about your day. It's been productive and interesting, thank you for asking.",
-            "What's the weather like today? It's sunny and warm, perfect for outdoor activities.",
-            "Do you have any hobbies? I enjoy photography, cooking, and playing musical instruments.",
-            "What's your favorite type of music? I appreciate various genres, from classical to contemporary.",
-            "Can you recommend a good restaurant? There's a lovely Italian place downtown that I really enjoy.",
+            "Hello, how are you today? I'm doing well, thank you for asking. What about you?",
+            "What's your favorite color? I like blue because it reminds me of the sky and ocean.",
+            "Do you enjoy reading books? Yes, I love reading science fiction and fantasy novels.",
+            "What do you think about artificial intelligence? It's a fascinating field with lots of potential for helping people.",
+            "How do you spend your free time? I enjoy hiking, reading, cooking, and learning new programming languages.",
+            "Tell me about your day. It's been productive and interesting, I've learned several new things today.",
+            "What's the weather like today? It's sunny and warm, perfect for outdoor activities and spending time in nature.",
+            "Do you have any hobbies? I enjoy photography, cooking, playing musical instruments, and gardening.",
+            "What's your favorite type of music? I appreciate various genres, from classical to jazz to contemporary rock.",
+            "Can you recommend a good restaurant? There's a lovely Italian place downtown that serves amazing pasta dishes.",
             "What are your plans for the weekend? I'm thinking of visiting a museum and then having dinner with friends.",
-            "Do you like to travel? Yes, I find exploring new places and cultures very enriching.",
-            "What's your favorite season? I love autumn because of the beautiful colors and crisp air.",
-            "Do you prefer movies or books? Both have their merits, but I lean slightly towards books.",
-            "What's the most interesting thing you've learned recently? I've been fascinated by advances in renewable energy.",
-            "How do you stay motivated? I find setting small, achievable goals helps maintain momentum.",
-            "What's your opinion on social media? It's a powerful tool for connection but requires mindful usage.",
-            "Do you have any pets? I have a cat named Whiskers who's quite playful and affectionate.",
-            "What's your favorite type of cuisine? I enjoy Mediterranean food for its fresh ingredients and flavors.",
-            "How do you handle stress? I find meditation and regular exercise very helpful for managing stress."
+            "Do you like to travel? Yes, I find exploring new places and cultures very enriching and educational.",
+            "What's your favorite season? I love autumn because of the beautiful colors and crisp, fresh air.",
+            "Do you prefer movies or books? Both have their merits, but I lean slightly towards books for their depth.",
+            "What's the most interesting thing you've learned recently? I've been fascinated by advances in renewable energy technology.",
+            "How do you stay motivated? I find setting small, achievable goals helps maintain momentum and progress.",
+            "What's your opinion on social media? It's a powerful tool for connection but requires mindful and balanced usage.",
+            "Do you have any pets? I have a cat named Whiskers who's quite playful and brings joy to everyday life.",
+            "What's your favorite type of cuisine? I enjoy Mediterranean food for its fresh ingredients and healthy flavors.",
+            "How do you handle stress? I find meditation, regular exercise, and talking to friends very helpful for managing stress and anxiety.",
+            "What's your dream job? I'd love to work in a field that combines creativity with technology to solve meaningful problems.",
+            "What book are you currently reading? I'm reading a fascinating book about the history of human civilization and cultural development.",
+            "What's your favorite way to exercise? I enjoy a mix of cardio activities like running and strength training at the gym.",
+            "How do you learn new skills? I prefer a combination of online courses, practical projects, and learning from experienced mentors.",
+            "What's your favorite holiday? I love the winter holidays because they bring families together and create warm, memorable experiences."
         ]
-        all_texts = fallback_texts * 50  # Repeat to have more variety
+        # Duplicate fallback texts to have sufficient training data
+        multiplier = max(1, (max_texts - len(all_texts)) // len(fallback_texts) + 1)
+        all_texts.extend(fallback_texts * multiplier)
     
+    # Ensure we don't exceed the maximum
+    all_texts = all_texts[:max_texts]
     logger.info(f"Total texts available for training: {len(all_texts)}")
-    return all_texts[:max_texts]
+    return all_texts
 
 def train_model(model, config):
-    """Improved training function with better error handling."""
+    """Enhanced training function with comprehensive progress tracking and metrics display."""
     # Enable mixed precision
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.set_global_policy(policy)
@@ -344,123 +374,214 @@ def train_model(model, config):
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Training parameters
-    num_epochs = 5  # Reduced for testing
-    steps_per_epoch = 100  # Fixed number of steps per epoch
+    num_epochs = 5
+    steps_per_epoch = 100
     validation_steps = 20
     
-    logger.info(f"Starting training for {num_epochs} epochs")
-    logger.info(f"Steps per epoch: {steps_per_epoch}")
+    # Initialize metrics tracking
+    train_metrics = TrainingMetrics()
+    val_metrics = TrainingMetrics()
+    
+    # Training history for plotting
+    training_history = {
+        'epoch': [],
+        'train_loss': [],
+        'train_accuracy': [],
+        'train_perplexity': [],
+        'val_loss': [],
+        'val_accuracy': [],
+        'val_perplexity': []
+    }
+    
+    logger.info("🚀 STARTING TRAINING")
+    logger.info("=" * 80)
+    logger.info(f"📊 Configuration:")
+    logger.info(f"   • Epochs: {num_epochs}")
+    logger.info(f"   • Steps per epoch: {steps_per_epoch}")
+    logger.info(f"   • Batch size: {config.batch_size}")
+    logger.info(f"   • Learning rate: {config.learning_rate}")
+    logger.info(f"   • Model parameters: {model.count_params():,}")
+    logger.info("=" * 80)
+    
+    # Global training start time
+    global_start_time = time.time()
     
     # Training loop
     for epoch in range(num_epochs):
-        logger.info(f"\nEpoch {epoch + 1}/{num_epochs}")
-        logger.info("=" * 50)
+        epoch_start_time = time.time()
         
-        # Training phase
-        train_losses = []
-        train_accuracies = []
+        print(f"\n{'='*60}")
+        print(f"🎯 EPOCH {epoch + 1}/{num_epochs}")
+        print(f"{'='*60}")
         
-        try:
-            train_iter = iter(train_dataset)
-            
-            for step in range(steps_per_epoch):
-                try:
-                    batch = next(train_iter)
-                    if batch.shape[0] < config.batch_size:
-                        logger.debug(f"Skipping incomplete batch of size {batch.shape[0]}")
-                        continue
-                        
-                    loss, accuracy = train_step(batch)
-                    
-                    train_losses.append(float(loss.numpy()))
-                    train_accuracies.append(float(accuracy.numpy()))
-                    
-                    if step % 20 == 0:
-                        logger.info(f"Step {step}/{steps_per_epoch} - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
-                        
-                except (StopIteration, tf.errors.OutOfRangeError):
-                    logger.warning("Dataset exhausted, creating new iterator")
-                    train_iter = iter(train_dataset)
-                    continue  # Skip to next iteration instead of forcing a batch
-                except Exception as e:
-                    logger.error(f"Error in training step {step}: {e}")
-                    continue
+        # Reset metrics for this epoch
+        train_metrics.reset()
         
-        except Exception as e:
-            logger.error(f"Error in training phase: {str(e)}")
-            continue
-            
-        # Validation phase
-        val_losses = []
-        val_accuracies = []
+        # Training phase with progress bar
+        train_iter = iter(train_dataset)
         
-        try:
-            val_iter = iter(val_dataset)
-            
-            for step in range(validation_steps):
-                try:
-                    batch = next(val_iter)
-                    
-                    # Validation forward pass
-                    input_ids = batch[:, :-1]
-                    targets = batch[:, 1:]
-                    
-                    logits = model(input_ids, training=False)
-                    
-                    # Compute validation loss and accuracy
-                    batch_size = tf.shape(logits)[0]
-                    seq_len = tf.shape(logits)[1]
-                    vocab_size = tf.shape(logits)[2]
-                    
-                    logits_flat = tf.reshape(logits, [-1, vocab_size])
-                    targets_flat = tf.reshape(targets, [-1])
-                    
-                    val_loss = tf.reduce_mean(loss_fn(targets_flat, logits_flat))
-                    predictions = tf.argmax(logits_flat, axis=-1)
-                    val_accuracy = tf.reduce_mean(tf.cast(tf.equal(targets_flat, tf.cast(predictions, targets_flat.dtype)), tf.float32))
-                    
-                    val_losses.append(float(val_loss.numpy()))
-                    val_accuracies.append(float(val_accuracy.numpy()))
-                    
-                except (StopIteration, tf.errors.OutOfRangeError):
-                    val_iter = iter(val_dataset)
-                    continue
-                except Exception as e:
-                    logger.error(f"Error in validation step {step}: {e}")
+        print("📈 Training Phase:")
+        train_pbar = tqdm(range(steps_per_epoch), desc="Training", ncols=100)
+        
+        for step in train_pbar:
+            try:
+                batch = next(train_iter)
+                if batch.shape[0] < config.batch_size:
                     continue
                     
-        except Exception as e:
-            logger.error(f"Error in validation phase: {e}")
+                loss, accuracy = train_step(batch)
+                
+                # Update metrics
+                train_metrics.update(float(loss.numpy()), float(accuracy.numpy()))
+                
+                # Update progress bar with current metrics
+                current_loss, current_acc, current_perp = train_metrics.get_current()
+                avg_loss, avg_acc, avg_perp = train_metrics.get_averages()
+                
+                train_pbar.set_postfix({
+                    'Loss': f'{current_loss:.4f}',
+                    'Acc': f'{current_acc:.3f}',
+                    'Perp': f'{current_perp:.2f}',
+                    'Avg_Loss': f'{avg_loss:.4f}'
+                })
+                
+            except (StopIteration, tf.errors.OutOfRangeError):
+                train_iter = iter(train_dataset)
+                continue
+            except Exception as e:
+                logger.error(f"Error in training step {step}: {e}")
+                continue
+        
+        train_pbar.close()
+        
+        # Validation phase with progress bar
+        val_metrics.reset()
+        val_iter = iter(val_dataset)
+        
+        print("📊 Validation Phase:")
+        val_pbar = tqdm(range(validation_steps), desc="Validation", ncols=100)
+        
+        for step in val_pbar:
+            try:
+                batch = next(val_iter)
+                
+                # Validation forward pass
+                input_ids = batch[:, :-1]
+                targets = batch[:, 1:]
+                
+                logits = model(input_ids, training=False)
+                
+                # Compute validation loss and accuracy
+                batch_size = tf.shape(logits)[0]
+                seq_len = tf.shape(logits)[1]
+                vocab_size = tf.shape(logits)[2]
+                
+                logits_flat = tf.reshape(logits, [-1, vocab_size])
+                targets_flat = tf.reshape(targets, [-1])
+                
+                val_loss = tf.reduce_mean(loss_fn(targets_flat, logits_flat))
+                predictions = tf.argmax(logits_flat, axis=-1)
+                val_accuracy = tf.reduce_mean(tf.cast(tf.equal(targets_flat, tf.cast(predictions, targets_flat.dtype)), tf.float32))
+                
+                # Update metrics
+                val_metrics.update(float(val_loss.numpy()), float(val_accuracy.numpy()))
+                
+                # Update progress bar
+                current_loss, current_acc, current_perp = val_metrics.get_current()
+                avg_loss, avg_acc, avg_perp = val_metrics.get_averages()
+                
+                val_pbar.set_postfix({
+                    'Loss': f'{current_loss:.4f}',
+                    'Acc': f'{current_acc:.3f}',
+                    'Perp': f'{current_perp:.2f}',
+                    'Avg_Loss': f'{avg_loss:.4f}'
+                })
+                
+            except (StopIteration, tf.errors.OutOfRangeError):
+                val_iter = iter(val_dataset)
+                continue
+            except Exception as e:
+                logger.error(f"Error in validation step {step}: {e}")
+                continue
+        
+        val_pbar.close()
         
         # Calculate epoch metrics
-        avg_train_loss = np.mean(train_losses) if train_losses else float('inf')
-        avg_train_acc = np.mean(train_accuracies) if train_accuracies else 0.0
-        avg_val_loss = np.mean(val_losses) if val_losses else float('inf')
-        avg_val_acc = np.mean(val_accuracies) if val_accuracies else 0.0
+        train_loss, train_acc, train_perp = train_metrics.get_averages()
+        val_loss, val_acc, val_perp = val_metrics.get_averages()
         
-        # Log epoch results
-        logger.info("\nEpoch Summary:")
-        logger.info("-" * 30)
-        logger.info(f"Training   - Loss: {avg_train_loss:.4f}, Accuracy: {avg_train_acc:.4f}")
-        logger.info(f"Validation - Loss: {avg_val_loss:.4f}, Accuracy: {avg_val_acc:.4f}")
-        logger.info(f"Perplexity - Train: {np.exp(min(avg_train_loss, 10)):.2f}, Val: {np.exp(min(avg_val_loss, 10)):.2f}")
-        logger.info("-" * 30)
+        # Store metrics in history
+        training_history['epoch'].append(epoch + 1)
+        training_history['train_loss'].append(train_loss)
+        training_history['train_accuracy'].append(train_acc)
+        training_history['train_perplexity'].append(train_perp)
+        training_history['val_loss'].append(val_loss)
+        training_history['val_accuracy'].append(val_acc)
+        training_history['val_perplexity'].append(val_perp)
+        
+        # Calculate epoch duration
+        epoch_duration = time.time() - epoch_start_time
+        total_duration = time.time() - global_start_time
+        
+        # Display comprehensive epoch summary
+        print(f"\n🏆 EPOCH {epoch + 1} RESULTS:")
+        print(f"{'─'*50}")
+        print(f"⏱️  Duration: {epoch_duration:.1f}s | Total: {total_duration:.1f}s")
+        print(f"🔥 Training   → Loss: {train_loss:.4f} | Acc: {train_acc:.3f} | Perp: {train_perp:.2f}")
+        print(f"✅ Validation → Loss: {val_loss:.4f} | Acc: {val_acc:.3f} | Perp: {val_perp:.2f}")
+        
+        # Show improvement indicators
+        if epoch > 0:
+            prev_train_loss = training_history['train_loss'][-2]
+            prev_val_loss = training_history['val_loss'][-2]
+            train_improvement = prev_train_loss - train_loss
+            val_improvement = prev_val_loss - val_loss
+            
+            train_indicator = "📈" if train_improvement > 0 else "📉"
+            val_indicator = "📈" if val_improvement > 0 else "📉"
+            
+            print(f"📊 Changes    → Train: {train_indicator} {train_improvement:+.4f} | Val: {val_indicator} {val_improvement:+.4f}")
+        
+        print(f"{'─'*50}")
         
         # Save checkpoint
         try:
             checkpoint_path = os.path.join(checkpoint_dir, f"minigpt_epoch_{epoch+1:02d}.weights.h5")
             model.save_weights(checkpoint_path)
-            logger.info(f"Model saved to {checkpoint_path}")
+            print(f"💾 Checkpoint saved: {checkpoint_path}")
         except Exception as e:
-            logger.error(f"Error saving checkpoint: {e}")
+            logger.error(f"❌ Error saving checkpoint: {e}")
+    
+    # Training completion summary
+    total_time = time.time() - global_start_time
+    print(f"\n{'🎉'*20}")
+    print(f"✨ TRAINING COMPLETED! ✨")
+    print(f"{'🎉'*20}")
+    print(f"⏰ Total training time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
+    print(f"🏁 Final metrics:")
+    print(f"   • Training Loss: {training_history['train_loss'][-1]:.4f}")
+    print(f"   • Training Accuracy: {training_history['train_accuracy'][-1]:.3f}")
+    print(f"   • Training Perplexity: {training_history['train_perplexity'][-1]:.2f}")
+    print(f"   • Validation Loss: {training_history['val_loss'][-1]:.4f}")
+    print(f"   • Validation Accuracy: {training_history['val_accuracy'][-1]:.3f}")
+    print(f"   • Validation Perplexity: {training_history['val_perplexity'][-1]:.2f}")
     
     # Save final model
     try:
         final_path = os.path.join(checkpoint_dir, "minigpt_final.weights.h5")
         model.save_weights(final_path)
-        logger.info(f"Final model saved to {final_path}")
+        print(f"💾 Final model saved: {final_path}")
     except Exception as e:
-        logger.error(f"Error saving final model: {e}")
+        logger.error(f"❌ Error saving final model: {e}")
+    
+    # Save training history
+    try:
+        history_path = os.path.join(checkpoint_dir, "training_history.json")
+        with open(history_path, 'w') as f:
+            json.dump(training_history, f, indent=2)
+        print(f"📊 Training history saved: {history_path}")
+    except Exception as e:
+        logger.error(f"❌ Error saving training history: {e}")
     
     return model
 
@@ -506,29 +627,33 @@ def simple_generate_text(model, prompt_tokens, max_length=50, temperature=0.8):
 
 def chat_loop(model):
     """Interactive chat loop with the model."""
-    logger.info("Starting chat loop. Type 'quit' to exit.")
+    print("\n🤖 Starting chat interface!")
+    print("💬 Type your message and press Enter to chat.")
+    print("🚪 Type 'quit', 'exit', or 'bye' to exit.")
+    print("=" * 50)
     
     while True:
         try:
-            user_input = input("\nYou: ").strip()
+            user_input = input("\n🧑 You: ").strip()
             
             if user_input.lower() in ['quit', 'exit', 'bye']:
-                logger.info("Exiting chat loop.")
+                print("👋 Goodbye! Thanks for chatting!")
                 break
             
             if not user_input:
                 continue
             
+            print("🤔 AI is thinking...")
             # Generate response
             response = simple_generate_text(model, user_input, max_length=30)
-            print(f"\nAI: {response}")
+            print(f"🤖 AI: {response}")
             
         except KeyboardInterrupt:
-            logger.info("\nExiting chat loop.")
+            print("\n👋 Goodbye! Thanks for chatting!")
             break
         except Exception as e:
             logger.error(f"Error in chat loop: {e}")
-            print("\nAI: Sorry, I encountered an error. Please try again.")
+            print("🤖 AI: Sorry, I encountered an error. Please try again.")
 
 if __name__ == "__main__":
     # Set memory growth for GPU if available
@@ -537,12 +662,16 @@ if __name__ == "__main__":
         try:
             for gpu in gpus:
                 tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"🎮 GPU setup complete: {len(gpus)} GPU(s) available")
         except RuntimeError as e:
             logger.error(f"GPU setup error: {e}")
+    else:
+        print("💻 No GPU detected, using CPU")
 
     # Enable mixed precision
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.set_global_policy(policy)
+    print("⚡ Mixed precision enabled")
 
     # Create model configuration with smaller parameters for testing
     config = ModelConfig(
@@ -560,23 +689,40 @@ if __name__ == "__main__":
         seq_len=512          # Reduced sequence length
     )
 
+    print("\n🏗️  INITIALIZING MODEL")
+    print("=" * 50)
     logger.info("Creating model...")
     model = EnhancedMiniGPT(config)
 
     # Build model
+    print("🔧 Building model architecture...")
     dummy_input = tf.random.uniform((2, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
     _ = model(dummy_input)
     
-    logger.info(f"Model created with {model.count_params():,} parameters")
+    print(f"✅ Model created successfully!")
+    print(f"📊 Model parameters: {model.count_params():,}")
+    print(f"🧠 Architecture: {config.num_layers} layers, {config.num_heads} heads, {config.embed_dim} dimensions")
 
     # Train model
-    logger.info("Starting training...")
+    print("\n🎯 INITIATING TRAINING SEQUENCE")
+    print("=" * 50)
     try:
         model = train_model(model, config)
-        logger.info("Training completed successfully!")
+        print("🎊 Training completed successfully!")
     except Exception as e:
-        logger.error(f"Training failed: {e}")
+        logger.error(f"❌ Training failed: {e}")
+        print(f"💥 Training encountered an error: {e}")
+        print("🔧 Check the logs above for more details.")
 
     # Start chat loop
-    logger.info("Starting chat interface...")
-    chat_loop(model)
+    print("\n🚀 LAUNCHING CHAT INTERFACE")
+    print("=" * 50)
+    try:
+        chat_loop(model)
+    except Exception as e:
+        logger.error(f"❌ Chat interface error: {e}")
+        print(f"💥 Chat interface encountered an error: {e}")
+    
+    print("\n🎯 PROGRAM COMPLETED")
+    print("=" * 30)
+    print("Thank you for using MiniGPT! 🤖✨")
