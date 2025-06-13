@@ -22,9 +22,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def create_dummy_dataset(vocab_size: int = 50257, seq_len: int = 128, batch_size: int = 2, num_samples: int = 1000):
-    """Create a dummy dataset for testing with proper batching."""
+    """Create a dummy dataset for testing with proper batching and infinite repeat."""
     def data_generator():
-        for _ in range(num_samples):
+        while True:  # Make the generator infinite
             # Generate random input sequence
             input_ids = np.random.randint(0, vocab_size, size=(seq_len,), dtype=np.int32)
             yield input_ids
@@ -35,49 +35,42 @@ def create_dummy_dataset(vocab_size: int = 50257, seq_len: int = 128, batch_size
         output_signature=tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
     )
     
-    # Batch and repeat the dataset
+    # Batch and prefetch
     dataset = dataset.batch(batch_size, drop_remainder=True)
-    dataset = dataset.repeat()  # Make dataset infinite
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
     return dataset
 
 def create_text_dataset(texts, tokenizer, seq_len=512, batch_size=8):
-    """Create a dataset from texts with proper error handling."""
+    """Create an infinite dataset from texts."""
     if not texts or not tokenizer:
         logger.warning("No texts or tokenizer provided")
         return None
         
     def data_generator():
-        for text in texts:
-            if not isinstance(text, str) or len(text.strip()) == 0:
-                continue
-                
-            try:
-                # Tokenize text
-                tokens = tokenizer.encode(text.strip())
-                
-                # Create sequences with stride
-                stride = seq_len // 2
-                for i in range(0, len(tokens) - seq_len + 1, stride):
-                    sequence = tokens[i:i + seq_len]
-                    if len(sequence) == seq_len:
-                        yield np.array(sequence, dtype=np.int32)
-            except Exception as e:
-                logger.warning(f"Error processing text: {e}")
-                continue
+        while True:  # Make the generator infinite
+            for text in texts:
+                if not isinstance(text, str) or len(text.strip()) == 0:
+                    continue
+                    
+                try:
+                    tokens = tokenizer.encode(text.strip())
+                    stride = seq_len // 2
+                    for i in range(0, len(tokens) - seq_len + 1, stride):
+                        sequence = tokens[i:i + seq_len]
+                        if len(sequence) == seq_len:
+                            yield np.array(sequence, dtype=np.int32)
+                except Exception as e:
+                    logger.warning(f"Error processing text: {e}")
+                    continue
     
     try:
-        # Create dataset
         dataset = tf.data.Dataset.from_generator(
             data_generator,
             output_signature=tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
         )
         
-        # Filter out empty sequences and batch
-        dataset = dataset.filter(lambda x: tf.size(x) > 0)
         dataset = dataset.batch(batch_size, drop_remainder=True)
-        dataset = dataset.repeat()  # Make dataset infinite
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
         
         return dataset
@@ -267,6 +260,10 @@ def train_model(model, config):
             for step in range(steps_per_epoch):
                 try:
                     batch = next(train_iter)
+                    if batch.shape[0] < config.batch_size:
+                        logger.debug(f"Skipping incomplete batch of size {batch.shape[0]}")
+                        continue
+                        
                     loss, accuracy = train_step(batch)
                     
                     train_losses.append(float(loss.numpy()))
@@ -276,20 +273,17 @@ def train_model(model, config):
                         logger.info(f"Step {step}/{steps_per_epoch} - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
                         
                 except (StopIteration, tf.errors.OutOfRangeError):
-                    logger.warning("Dataset exhausted, recreating iterator")
+                    logger.warning("Dataset exhausted, creating new iterator")
                     train_iter = iter(train_dataset)
-                    batch = next(train_iter)
-                    loss, accuracy = train_step(batch)
-                    train_losses.append(float(loss.numpy()))
-                    train_accuracies.append(float(accuracy.numpy()))
+                    continue  # Skip to next iteration instead of forcing a batch
                 except Exception as e:
                     logger.error(f"Error in training step {step}: {e}")
                     continue
         
         except Exception as e:
-            logger.error(f"Error in training phase: {e}")
+            logger.error(f"Error in training phase: {str(e)}")
             continue
-        
+            
         # Validation phase
         val_losses = []
         val_accuracies = []
@@ -439,11 +433,11 @@ if __name__ == "__main__":
                 tf.config.experimental.set_memory_growth(gpu, True)
         except RuntimeError as e:
             logger.error(f"GPU setup error: {e}")
-    
+
     # Enable mixed precision
     policy = tf.keras.mixed_precision.Policy('mixed_float16')
     tf.keras.mixed_precision.set_global_policy(policy)
-    
+
     # Create model configuration with smaller parameters for testing
     config = ModelConfig(
         vocab_size=50257,
@@ -457,18 +451,18 @@ if __name__ == "__main__":
         use_rotary_embeddings=True,
         learning_rate=5e-4,  # Slightly higher learning rate
         batch_size=4,        # Reduced batch size
-        seq_len=512
+        seq_len=512          # Reduced sequence length
     )
-    
+
     logger.info("Creating model...")
     model = EnhancedMiniGPT(config)
-    
+
     # Build model
     dummy_input = tf.random.uniform((2, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
     _ = model(dummy_input)
     
     logger.info(f"Model created with {model.count_params():,} parameters")
-    
+
     # Train model
     logger.info("Starting training...")
     try:
@@ -476,7 +470,7 @@ if __name__ == "__main__":
         logger.info("Training completed successfully!")
     except Exception as e:
         logger.error(f"Training failed: {e}")
-    
+
     # Start chat loop
     logger.info("Starting chat interface...")
     chat_loop(model)
