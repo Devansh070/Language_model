@@ -1,43 +1,25 @@
 import tensorflow as tf
 from tensorflow.keras import layers, Model
-import logging
-from typing import Optional, List, Tuple
+import numpy as np
 from dataclasses import dataclass
-
-# Set mixed precision policy
-policy = tf.keras.mixed_precision.Policy('mixed_float16')
-tf.keras.mixed_precision.set_global_policy(policy)
-
-# Configure logging first
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+from typing import Optional, List, Tuple, Dict
+import os
+import logging
+import time
 
 # Optional: only import if transformers is available
 try:
-    from transformers import GPT2Tokenizer as _GPT2Tokenizer
-    from transformers import AutoTokenizer as _AutoTokenizer
-    GPT2TokenizerClass = _GPT2Tokenizer
+    from transformers import AutoTokenizer
     HAS_TRANSFORMERS = True
-    logger.info("Successfully imported transformers library")
 except ImportError:
-    logger.warning("transformers library not found. Tokenizer features will be disabled.")
+    print("Warning: transformers library not found. Tokenizer features will be disabled.")
     HAS_TRANSFORMERS = False
-    GPT2Tokenizer = None
-    AutoTokenizer = None
 
-def create_dense_float16(units, activation=None, name=None, **kwargs):
-    """Helper function to create Dense layers with float16 dtype."""
-    return tf.keras.layers.Dense(
-        units=units,
-        activation=activation,
-        dtype=tf.float16,
-        name=name,
-        **kwargs
-    )
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
+@dataclass
 class ModelConfig:
     """Configuration for the MiniGPT model."""
     def __init__(
@@ -53,7 +35,7 @@ class ModelConfig:
         use_custom_attention: bool = True,
         use_rotary_embeddings: bool = True,
         learning_rate: float = 1e-4,
-        batch_size: int = 1,
+        batch_size: int = 1,  # Changed from 8 to 1
         seq_len: int = 1024
     ):
         self.vocab_size = vocab_size
@@ -71,208 +53,288 @@ class ModelConfig:
         self.seq_len = seq_len
 
 class RotaryPositionalEmbedding(layers.Layer):
-    """Fixed Rotary Positional Embedding layer with proper float16 support."""
-    
-    def __init__(self, dim, max_seq_len=1024, dtype=tf.float16, **kwargs):
-        super().__init__(dtype=dtype, **kwargs)
+    """Rotary Positional Embedding layer."""
+    def __init__(self, dim, max_seq_len=1024, **kwargs):
+        super().__init__(**kwargs)
         self.dim = dim
         self.max_seq_len = max_seq_len
         
-        # Compute in float32 for precision, store as variables for gradient flow
-        with tf.name_scope('rotary_embedding_init'):
-            position = tf.range(max_seq_len, dtype=tf.float32)
-            div_term_exp = tf.range(0, dim, 2, dtype=tf.float32) * (-tf.math.log(10000.0) / dim)
-            div_term = tf.exp(div_term_exp)
-            
-            # Compute positional encodings in float32
-            pos = tf.einsum('i,j->ij', position, div_term)
-            
-            # Create as variables instead of constants for better gradient flow
-            self.sin_vals = self.add_weight(
-                name="sin_vals",
-                shape=(max_seq_len, dim // 2),
-                initializer="zeros",
-                trainable=False,
-                dtype=tf.float16
-            )
-            self.cos_vals = self.add_weight(
-                name="cos_vals", 
-                shape=(max_seq_len, dim // 2),
-                initializer="zeros",
-                trainable=False,
-                dtype=tf.float16
-            )
-            
-            # Assign computed values
-            self.sin_vals.assign(tf.cast(tf.sin(pos), tf.float16))
-            self.cos_vals.assign(tf.cast(tf.cos(pos), tf.float16))
+        # Create position indices
+        position = tf.range(max_seq_len, dtype=tf.float32)
+        div_term = tf.exp(tf.range(0, dim, 2, dtype=tf.float32) * -(tf.math.log(10000.0) / dim))
+        
+        # Calculate sin and cos values
+        pos = tf.expand_dims(position, 1) * tf.expand_dims(div_term, 0)
+        self.sin_vals = tf.sin(pos)
+        self.cos_vals = tf.cos(pos)
     
     def _apply_rotary_pos_emb(self, x, sin, cos):
-        """Fixed rotary positional embeddings with proper broadcasting."""
-        # Get shapes
-        batch_size = tf.shape(x)[0]
-        seq_len = tf.shape(x)[1] 
-        num_heads = tf.shape(x)[2]
-        head_dim = tf.shape(x)[3]
+        """Apply rotary positional embeddings to input tensor."""
+        # Reshape input for broadcasting
+        x_shape = tf.shape(x)
+        batch_size = x_shape[0]
+        seq_len = x_shape[1]
         
-        # Slice sin/cos to match sequence length
-        sin = sin[:seq_len, :]  # [seq_len, head_dim//2]
-        cos = cos[:seq_len, :]  # [seq_len, head_dim//2]
+        # Reshape sin and cos for broadcasting
+        sin = tf.expand_dims(sin[:seq_len], 0)  # [1, seq_len, dim/2]
+        cos = tf.expand_dims(cos[:seq_len], 0)  # [1, seq_len, dim/2]
         
-        # Expand dimensions for broadcasting: [1, seq_len, 1, head_dim//2]
-        sin = tf.expand_dims(tf.expand_dims(sin, 0), 2)
-        cos = tf.expand_dims(tf.expand_dims(cos, 0), 2)
-        
-        # Split x into two halves
+        # Split input into real and imaginary parts
         x1, x2 = tf.split(x, 2, axis=-1)
         
-        # Apply rotation
+        # Apply rotary embeddings
         rotated_x1 = cos * x1 - sin * x2
         rotated_x2 = sin * x1 + cos * x2
         
-        # Concatenate back
-        result = tf.concat([rotated_x1, rotated_x2], axis=-1)
-        return result
+        # Concatenate rotated parts
+        return tf.concat([rotated_x1, rotated_x2], axis=-1)
     
     def call(self, x, seq_len=None):
         """Apply rotary positional embeddings."""
         if seq_len is None:
             seq_len = tf.shape(x)[1]
         
-        # Ensure we don't exceed precomputed values
-        seq_len = tf.minimum(seq_len, self.max_seq_len)
+        # Get sin and cos values for the sequence length
+        sin = self.sin_vals[:seq_len]
+        cos = self.cos_vals[:seq_len]
         
-        return self._apply_rotary_pos_emb(x, self.sin_vals, self.cos_vals)
+        # Apply rotary embeddings
+        return self._apply_rotary_pos_emb(x, sin, cos)
     
     def get_config(self):
         config = super().get_config()
         config.update({
             'dim': self.dim,
-            'max_seq_len': self.max_seq_len,
-            'dtype': self.dtype
+            'max_seq_len': self.max_seq_len
         })
         return config
 
-class CustomMultiHeadAttention(tf.keras.layers.Layer):
-    """Fixed custom multi-head attention layer with proper float16 handling."""
+class CustomMultiHeadAttention(layers.Layer):
+    """
+    Custom implementation of Multi-Head Attention mechanism from scratch.
+    Supports causal masking and padding masking.
+    """
     
-    def __init__(
-        self,
-        num_heads: int,
-        key_dim: int,
-        use_rotary_embeddings: bool = True,
-        dropout: float = 0.1,
-        name: Optional[str] = "custom_attention",
-        **kwargs
-    ):
-        super().__init__(name=name, **kwargs)
+    def __init__(self, num_heads, key_dim, value_dim=None, dropout=0.0, use_bias=True, 
+                 output_shape=None, attention_axes=None, kernel_initializer="glorot_uniform",
+                 bias_initializer="zeros", kernel_regularizer=None, bias_regularizer=None,
+                 activity_regularizer=None, kernel_constraint=None, bias_constraint=None,
+                 **kwargs):
+        super().__init__(**kwargs)
         
         self.num_heads = num_heads
         self.key_dim = key_dim
-        self.use_rotary_embeddings = use_rotary_embeddings
+        self.value_dim = value_dim if value_dim is not None else key_dim
         self.dropout = dropout
-        
-        # Create projection layers - let mixed precision handle dtype
-        self.query_dense = layers.Dense(num_heads * key_dim, dtype=tf.float16, name='query_dense')
-        self.key_dense = layers.Dense(num_heads * key_dim, dtype=tf.float16, name='key_dense')
-        self.value_dense = layers.Dense(num_heads * key_dim, dtype=tf.float16, name='value_dense')
-        self.output_dense = layers.Dense(num_heads * key_dim, dtype=tf.float16, name='output_dense')
-        
-        self.dropout_layer = tf.keras.layers.Dropout(dropout, dtype=tf.float16)
-        
-        # Create rotary embeddings
-        if use_rotary_embeddings:
-            self.rotary_embeddings = RotaryPositionalEmbedding(key_dim)
-        
-        # Store scaling factor as a variable
-        self.scale = self.add_weight(
-            name="attention_scale",
-            shape=(),
-            initializer="zeros",
-            trainable=False,
-            dtype=tf.float16
-        )
-        self.scale.assign(tf.cast(1.0 / tf.math.sqrt(float(key_dim)), tf.float16))
+        self.use_bias = use_bias
+        self.output_shape = output_shape
+        self.attention_axes = attention_axes
+        self.kernel_initializer = kernel_initializer
+        self.bias_initializer = bias_initializer
+        self.kernel_regularizer = kernel_regularizer
+        self.bias_regularizer = bias_regularizer
+        self.activity_regularizer = activity_regularizer
+        self.kernel_constraint = kernel_constraint
+        self.bias_constraint = bias_constraint
     
-    def call(self, inputs, attention_mask=None, training=False):
-        batch_size = tf.shape(inputs)[0]
-        seq_len = tf.shape(inputs)[1]
-        
-        # Project to Q, K, V
-        q = self.query_dense(inputs)
-        k = self.key_dense(inputs)
-        v = self.value_dense(inputs)
-        
-        # Reshape for multi-head attention
-        q = tf.reshape(q, [batch_size, seq_len, self.num_heads, self.key_dim])
-        k = tf.reshape(k, [batch_size, seq_len, self.num_heads, self.key_dim])
-        v = tf.reshape(v, [batch_size, seq_len, self.num_heads, self.key_dim])
-        
-        # Apply rotary embeddings
-        if self.use_rotary_embeddings:
-            q = self.rotary_embeddings(q)
-            k = self.rotary_embeddings(k)
-        
-        # Transpose for attention computation
-        q = tf.transpose(q, [0, 2, 1, 3])  # [batch, heads, seq_len, key_dim]
-        k = tf.transpose(k, [0, 2, 1, 3])
-        v = tf.transpose(v, [0, 2, 1, 3])
-
-        q = tf.cast(self.query_dense(inputs), tf.float16)
-        k = tf.cast(self.key_dense(inputs), tf.float16)
-        v = tf.cast(self.value_dense(inputs), tf.float16)
-        
-        # Scaled dot-product attention
-        scores = tf.matmul(q, k, transpose_b=True)
-        scores = scores * self.scale
-        
-        # Create or apply attention mask - FIX: Ensure dtype consistency
-        if attention_mask is None:
-            # Create causal mask with proper dtype (float16 to match scores)
-            mask = tf.linalg.band_part(tf.ones([seq_len, seq_len], dtype=tf.float16), -1, 0)
-            # Use -10000.0 and cast to float16
-            mask = tf.where(mask == 0, tf.cast(-10000.0, tf.float16), tf.cast(0.0, tf.float16))
-            attention_mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)
+    def build(self, input_shape):
+        # Get input dimensions
+        if isinstance(input_shape, list):
+            query_shape = input_shape[0]
         else:
-            # Ensure provided mask has correct dtype
-            attention_mask = tf.cast(attention_mask, tf.float16)
+            query_shape = input_shape
         
-        scores = scores + attention_mask
+        # Get embedding dimension
+        self.embed_dim = query_shape[-1]
         
-        # Apply softmax
-        attention_weights = tf.nn.softmax(scores, axis=-1)
-        attention_weights = self.dropout_layer(attention_weights, training=training)
+        # Validate embedding dimension
+        if self.embed_dim % self.num_heads != 0:
+            raise ValueError(
+                f"embedding dimension {self.embed_dim} must be divisible by number of heads {self.num_heads}"
+            )
         
-        # Apply attention to values
-        context = tf.matmul(attention_weights, v)
+        # Calculate dimensions for each head
+        self.head_dim = self.embed_dim // self.num_heads
         
-        # Transpose and reshape
-        context = tf.transpose(context, [0, 2, 1, 3])
-        context = tf.reshape(context, [batch_size, seq_len, self.num_heads * self.key_dim])
+        # Create projection matrices for Q, K, V
+        self.query_dense = layers.Dense(
+            self.embed_dim,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer,
+            bias_initializer=self.bias_initializer,
+            kernel_regularizer=self.kernel_regularizer,
+            bias_regularizer=self.bias_regularizer,
+            kernel_constraint=self.kernel_constraint,
+            bias_constraint=self.bias_constraint,
+            name="query"
+        )
+        
+        self.key_dense = layers.Dense(
+            self.embed_dim,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer,
+            bias_initializer=self.bias_initializer,
+            kernel_regularizer=self.kernel_regularizer,
+            bias_regularizer=self.bias_regularizer,
+            kernel_constraint=self.kernel_constraint,
+            bias_constraint=self.bias_constraint,
+            name="key"
+        )
+        
+        self.value_dense = layers.Dense(
+            self.embed_dim,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer,
+            bias_initializer=self.bias_initializer,
+            kernel_regularizer=self.kernel_regularizer,
+            bias_regularizer=self.bias_regularizer,
+            kernel_constraint=self.kernel_constraint,
+            bias_constraint=self.bias_constraint,
+            name="value"
+        )
         
         # Output projection
-        output = self.output_dense(context)
+        self.output_dense = layers.Dense(
+            self.embed_dim,
+            use_bias=self.use_bias,
+            kernel_initializer=self.kernel_initializer,
+            bias_initializer=self.bias_initializer,
+            kernel_regularizer=self.kernel_regularizer,
+            bias_regularizer=self.bias_regularizer,
+            kernel_constraint=self.kernel_constraint,
+            bias_constraint=self.bias_constraint,
+            name="output"
+        )
+        
+        # Dropout layer
+        self.dropout_layer = layers.Dropout(self.dropout)
+        
+        super().build(input_shape)
+    
+    def call(self, inputs, mask=None, use_causal_mask=False, training=None):
+        """
+        Compute multi-head attention.
+        
+        Args:
+            inputs: Query tensor of shape [batch_size, seq_len, embed_dim]
+                   or list of [query, key, value] tensors
+            mask: Padding mask of shape [batch_size, seq_len] or [batch_size, seq_len, seq_len]
+            use_causal_mask: Whether to use causal masking
+            training: Whether the layer is in training mode
+        
+        Returns:
+            Output tensor of shape [batch_size, seq_len, embed_dim]
+        """
+        # Handle different input formats
+        if isinstance(inputs, list):
+            query, key, value = inputs
+        else:
+            query = key = value = inputs
+        
+        # Get shapes
+        batch_size = tf.shape(query)[0]
+        query_len = tf.shape(query)[1]
+        key_len = tf.shape(key)[1]
+        
+        # Project inputs to Q, K, V
+        query = self.query_dense(query)  # [batch_size, query_len, embed_dim]
+        key = self.key_dense(key)        # [batch_size, key_len, embed_dim]
+        value = self.value_dense(value)  # [batch_size, key_len, embed_dim]
+        
+        # Reshape for multi-head attention
+        query = tf.reshape(query, [batch_size, query_len, self.num_heads, self.head_dim])
+        key = tf.reshape(key, [batch_size, key_len, self.num_heads, self.head_dim])
+        value = tf.reshape(value, [batch_size, key_len, self.num_heads, self.head_dim])
+        
+        # Transpose for attention computation
+        query = tf.transpose(query, [0, 2, 1, 3])  # [batch_size, num_heads, query_len, head_dim]
+        key = tf.transpose(key, [0, 2, 1, 3])      # [batch_size, num_heads, key_len, head_dim]
+        value = tf.transpose(value, [0, 2, 1, 3])  # [batch_size, num_heads, key_len, head_dim]
+        
+        # Compute attention scores
+        scores = tf.matmul(query, key, transpose_b=True)  # [batch_size, num_heads, query_len, key_len]
+        
+        # Scale scores
+        scores = scores / tf.sqrt(tf.cast(self.head_dim, scores.dtype))
+        
+        # Apply causal mask if requested
+        if use_causal_mask:
+            # Create causal mask
+            causal_mask = tf.linalg.band_part(
+                tf.ones((query_len, key_len)), -1, 0
+            )
+            causal_mask = tf.cast(causal_mask, scores.dtype)
+            causal_mask = tf.expand_dims(tf.expand_dims(causal_mask, 0), 0)
+            
+            # Apply causal mask
+            scores = scores * causal_mask + (1.0 - causal_mask) * -1e9
+        
+        # Apply masks
+        if mask is not None:
+            # Handle different mask shapes
+            if len(mask.shape) == 2:
+                # Padding mask: [batch_size, seq_len]
+                mask = tf.expand_dims(tf.expand_dims(mask, 1), 1)
+                # Convert to attention mask
+                attention_mask = (1.0 - tf.cast(mask, scores.dtype)) * -1e9
+                scores = scores + attention_mask
+            elif len(mask.shape) == 4:
+                # Pre-computed attention mask: [batch_size, num_heads, query_len, key_len]
+                # or [1, 1, query_len, key_len] for broadcasting
+                scores = scores + mask
+            else:
+                # 3D mask: [batch_size, query_len, key_len]
+                mask = tf.expand_dims(mask, 1)  # Add head dimension
+                scores = scores + mask
+        
+        # Compute attention weights
+        attention_weights = tf.nn.softmax(scores, axis=-1)
+        
+        # Apply dropout to attention weights
+        attention_weights = self.dropout_layer(attention_weights, training=training)
+        
+        # Compute attention output
+        attention_output = tf.matmul(attention_weights, value)  # [batch_size, num_heads, query_len, head_dim]
+        
+        # Transpose and reshape
+        attention_output = tf.transpose(attention_output, [0, 2, 1, 3])  # [batch_size, query_len, num_heads, head_dim]
+        attention_output = tf.reshape(attention_output, [batch_size, query_len, self.embed_dim])
+        
+        # Final projection
+        output = self.output_dense(attention_output)
+        
         return output
+    
+    def compute_output_shape(self, input_shape):
+        if isinstance(input_shape, list):
+            query_shape = input_shape[0]
+        else:
+            query_shape = input_shape
+        
+        return tf.TensorShape([*query_shape[:-1], self.embed_dim])
     
     def get_config(self):
         config = super().get_config()
         config.update({
-            'num_heads': self.num_heads,
-            'key_dim': self.key_dim,
-            'use_rotary_embeddings': self.use_rotary_embeddings,
-            'dropout': self.dropout
+            "num_heads": self.num_heads,
+            "key_dim": self.key_dim,
+            "value_dim": self.value_dim,
+            "dropout": self.dropout,
+            "use_bias": self.use_bias,
+            "output_shape": self.output_shape,
+            "attention_axes": self.attention_axes,
+            "kernel_initializer": self.kernel_initializer,
+            "bias_initializer": self.bias_initializer,
+            "kernel_regularizer": self.kernel_regularizer,
+            "bias_regularizer": self.bias_regularizer,
+            "activity_regularizer": self.activity_regularizer,
+            "kernel_constraint": self.kernel_constraint,
+            "bias_constraint": self.bias_constraint,
         })
         return config
-    
-def safe_cast_float16(tensor, name=None):
-    """Safely cast tensor to float16 with overflow protection."""
-    with tf.name_scope(name or 'safe_cast_float16'):
-        # Clip to safe float16 range (leaving some margin)
-        tensor = tf.clip_by_value(tensor, -60000.0, 60000.0)
-        return tf.cast(tensor, tf.float16)
 
 class MultiHeadAttention(layers.Layer):
-    """Multi-head attention layer with improved float16 handling"""
+    """Multi-head attention layer with custom attention implementation"""
     
     def __init__(self, embed_dim, num_heads, dropout=0.1, max_seq_len=2048, use_custom_attention=True, **kwargs):
         super().__init__(**kwargs)
@@ -284,12 +346,14 @@ class MultiHeadAttention(layers.Layer):
         assert embed_dim % num_heads == 0
         self.head_dim = embed_dim // num_heads
         
-        # Query, Key, Value projections - let mixed precision handle dtype
+        # Query, Key, Value projections
         self.query_proj = layers.Dense(embed_dim, name='query_proj')
         self.key_proj = layers.Dense(embed_dim, name='key_proj')
         self.value_proj = layers.Dense(embed_dim, name='value_proj')
+        
+        # Output projection
         self.output_proj = layers.Dense(embed_dim, name='output_proj')
-
+        
         # Rotary position embedding
         self.rope = RotaryPositionalEmbedding(
             dim=self.head_dim,
@@ -307,16 +371,15 @@ class MultiHeadAttention(layers.Layer):
             )
         
         # Dropout
-        self.dropout = layers.Dropout(dropout, dtype=tf.float16)
-
+        self.dropout = layers.Dropout(dropout)
         
     def call(self, x, training=False):
         batch_size = tf.shape(x)[0]
         seq_len = tf.shape(x)[1]
         
         if self.use_custom_attention:
-            # Use custom attention
-            attention = self.custom_attention(x, training=training)
+            # Use custom attention - simplified mask creation
+            attention = self.custom_attention(x, use_causal_mask=True, training=training)
             return attention
         else:
             # Standard attention with RoPE
@@ -338,15 +401,11 @@ class MultiHeadAttention(layers.Layer):
             q = tf.transpose(q, perm=[0, 2, 1, 3])
             k = tf.transpose(k, perm=[0, 2, 1, 3])
             v = tf.transpose(v, perm=[0, 2, 1, 3])
-
-            q = tf.cast(self.query_proj(x), tf.float16)
-            k = tf.cast(self.key_proj(x), tf.float16)
-            v = tf.cast(self.value_proj(x), tf.float16)
             
-            # Create causal mask - use safer values
+            # Create causal mask
             mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
-            mask = tf.where(mask == 0, -10000.0, 0.0)  # Safer value for float16
-            mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)
+            mask = tf.where(mask == 0, -1e9, 0.0)
+            mask = tf.expand_dims(tf.expand_dims(mask, 0), 0)  # [1, 1, seq_len, seq_len]
             
             # Standard attention
             attention = self._scaled_dot_product_attention(q, k, v, mask, training)
@@ -361,10 +420,10 @@ class MultiHeadAttention(layers.Layer):
             return output
     
     def _scaled_dot_product_attention(self, q, k, v, mask=None, training=False):
-        """Standard scaled dot-product attention with float16 safety"""
+        """Standard scaled dot-product attention (fallback)"""
         # Compute attention scores
         scores = tf.matmul(q, k, transpose_b=True)
-        scores = scores / tf.math.sqrt(tf.cast(self.head_dim, tf.float32))
+        scores = scores / tf.sqrt(tf.cast(self.head_dim, tf.float32))
         
         # Apply mask if provided
         if mask is not None:
@@ -373,237 +432,316 @@ class MultiHeadAttention(layers.Layer):
         # Apply softmax
         attention_weights = tf.nn.softmax(scores, axis=-1)
         
+        # Apply dropout
+        attention_weights = self.dropout(attention_weights, training=training)
+        
         # Apply attention to values
         output = tf.matmul(attention_weights, v)
         
         return output
 
 class FeedForward(layers.Layer):
-    """Feed-forward network with improved float16 handling"""
+    """Feed-forward network"""
     
     def __init__(self, embed_dim, ffn_dim, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
-        # Let mixed precision policy handle dtype automatically
-        self.dense1 = layers.Dense(ffn_dim, activation='gelu', dtype=tf.float16, name='dense1')
-        self.dense2 = layers.Dense(embed_dim, dtype=tf.float16, name='dense2')
-
+        self.embed_dim = embed_dim
+        self.ffn_dim = ffn_dim
         
-        # Dropout
-        self.dropout = layers.Dropout(dropout, dtype=tf.float16)
- 
+        self.dense1 = layers.Dense(ffn_dim, activation='gelu', name='dense1')
+        self.dense2 = layers.Dense(embed_dim, name='dense2')
+        self.dropout = layers.Dropout(dropout)
+        
     def call(self, x, training=False):
-        x = tf.cast(x, tf.float16)
-        x = self.dense1(x)  # GELU activation
+        x = self.dense1(x)
         x = self.dropout(x, training=training)
         x = self.dense2(x)
-        return tf.cast(x, tf.float16)
+        return x
 
-class TransformerBlock(tf.keras.layers.Layer):
-    """Transformer block with improved float16 handling."""
+class TransformerBlock(layers.Layer):
+    """Transformer block with attention and feed-forward layers"""
     
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        ff_dim: int,
-        dropout_rate: float = 0.1,
-        use_custom_attention: bool = True,
-        use_rotary_embeddings: bool = True,
-        name: Optional[str] = "transformer_block",
-        **kwargs
-    ):
-        super().__init__(name=name, **kwargs)
+    def __init__(self, embed_dim, num_heads, ffn_dim, dropout=0.1, layer_norm_epsilon=1e-5, max_seq_len=2048, **kwargs):
+        super().__init__(**kwargs)
         
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.ff_dim = ff_dim
-        self.dropout_rate = dropout_rate
-        self.use_custom_attention = use_custom_attention
-        self.use_rotary_embeddings = use_rotary_embeddings
-        
-        # Create attention layer
-        if use_custom_attention:
-            self.attention = CustomMultiHeadAttention(
-                num_heads=num_heads,
-                key_dim=embed_dim // num_heads,
-                use_rotary_embeddings=use_rotary_embeddings,
-                dropout=dropout_rate
-            )
-        else:
-            self.attention = MultiHeadAttention(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                dropout=dropout_rate,
-                max_seq_len=2048,
-                use_custom_attention=False
-            )
+        # Multi-head attention with RoPE
+        self.attention = MultiHeadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+            use_custom_attention=True,
+            name='attention'
+        )
         
         # Feed-forward network
         self.ffn = FeedForward(
             embed_dim=embed_dim,
-            ffn_dim=ff_dim,
-            dropout=dropout_rate
+            ffn_dim=ffn_dim,
+            dropout=dropout,
+            name='ffn'
         )
         
-        # Layer normalization - let mixed precision handle dtype
-        self.ln1 = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=tf.float16)
-        self.ln2 = tf.keras.layers.LayerNormalization(epsilon=1e-6, dtype=tf.float16)
+        # Layer normalization
+        self.ln1 = layers.LayerNormalization(epsilon=layer_norm_epsilon, name='ln1')
+        self.ln2 = layers.LayerNormalization(epsilon=layer_norm_epsilon, name='ln2')
         
         # Dropout
-        self.dropout1 = tf.keras.layers.Dropout(dropout_rate, dtype=tf.float16)
-        self.dropout2 = tf.keras.layers.Dropout(dropout_rate, dtype=tf.float16)
-    
-    def call(self, inputs, training=False):
-        # Ensure inputs are float16
-        inputs = tf.cast(inputs, tf.float16)
+        self.dropout = layers.Dropout(dropout)
         
-        # Self-attention and residual connection
-        attn_output = self.attention(inputs, training=training)
-        attn_output = tf.cast(attn_output, tf.float16)  # Ensure float16
-        attn_output = self.dropout1(attn_output, training=training)
+    def call(self, x, training=False):
+        # Pre-norm attention
+        attn_input = self.ln1(x)
+        attn_output = self.attention(attn_input, training=training)
+        attn_output = self.dropout(attn_output, training=training)
+        x = x + attn_output
         
-        # Residual connection with matching dtypes
-        out1 = self.ln1(tf.cast(inputs, tf.float16) + tf.cast(attn_output, tf.float16))
+        # Pre-norm feed-forward
+        ffn_input = self.ln2(x)
+        ffn_output = self.ffn(ffn_input, training=training)
+        ffn_output = self.dropout(ffn_output, training=training)
+        x = x + ffn_output
         
-        # Feed-forward network and residual connection  
-        ffn_output = self.ffn(out1, training=training)
-        ffn_output = tf.cast(ffn_output, tf.float16)  # Ensure float16
-        ffn_output = self.dropout2(ffn_output, training=training)
-        
-        # Residual connection with matching dtypes
-        out2 = self.ln2(tf.cast(out1, tf.float16) + tf.cast(ffn_output, tf.float16))
-        
-        return out2
-    
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'embed_dim': self.embed_dim,
-            'num_heads': self.num_heads,
-            'ff_dim': self.ff_dim,
-            'dropout_rate': self.dropout_rate,
-            'use_custom_attention': self.use_custom_attention,
-            'use_rotary_embeddings': self.use_rotary_embeddings
-        })
-        return config
+        return x
 
 class EnhancedMiniGPT(Model):
-    """Enhanced implementation of MiniGPT with proper float16 handling."""
+    """Enhanced MiniGPT model with additional features."""
     
-    def __init__(self, config: ModelConfig, **kwargs):
+    def __init__(self, config: ModelConfig = None, **kwargs):
         super().__init__(**kwargs)
+        self.config = config or ModelConfig()
         
-        self.config = config
+        # Initialize tokenizer
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            logger.info("Using GPT-2 tokenizer from transformers")
+        except ImportError:
+            logger.warning("transformers not available, using fallback tokenizer")
+            self.tokenizer = None
         
-        # Embeddings - let mixed precision handle dtype
-        self.token_emb = layers.Embedding(
-            config.vocab_size, 
-            config.embed_dim,
-            dtype=tf.float16,
-            name="token_emb"
+        # Build model components
+        self.build_model()
+        
+    def build_model(self):
+        """Build the model architecture."""
+        # Token embedding layer
+        self.token_embedding = layers.Embedding(
+            self.config.vocab_size,
+            self.config.embed_dim,
+            name="token_embedding"
         )
         
-        # Use simple positional embeddings
-        self.pos_emb = layers.Embedding(
-            config.max_seq_len,
-            config.embed_dim,
-            dtype=tf.float16,
-            name="pos_emb"
-        )
+        # Positional embedding layer
+        if self.config.use_rotary_embeddings:
+            self.pos_embedding = RotaryPositionalEmbedding(
+                self.config.embed_dim,
+                max_seq_len=self.config.max_seq_len,
+                name="rotary_pos_embedding"
+            )
+        else:
+            self.pos_embedding = layers.Embedding(
+                self.config.max_seq_len,
+                self.config.embed_dim,
+                name="position_embedding"
+            )
         
         # Transformer blocks
         self.transformer_blocks = [
             TransformerBlock(
-                embed_dim=config.embed_dim,
-                num_heads=config.num_heads,
-                ff_dim=config.ffn_dim,
-                dropout_rate=config.dropout,
-                use_custom_attention=config.use_custom_attention,
-                use_rotary_embeddings=config.use_rotary_embeddings,
+                embed_dim=self.config.embed_dim,
+                num_heads=self.config.num_heads,
+                ffn_dim=self.config.ffn_dim,
+                dropout=self.config.dropout,
+                layer_norm_epsilon=self.config.layer_norm_epsilon,
+                max_seq_len=self.config.max_seq_len,
                 name=f"transformer_block_{i}"
             )
-            for i in range(config.num_layers)
+            for i in range(self.config.num_layers)
         ]
         
-        # Layer normalization
-        self.ln_f = layers.LayerNormalization(
-            epsilon=config.layer_norm_epsilon, 
-            dtype=tf.float16,  # Explicit dtype
-            name="ln_f"
+        # Final layer norm
+        self.final_layer_norm = layers.LayerNormalization(
+            epsilon=self.config.layer_norm_epsilon,
+            name="final_layer_norm"
         )
         
-        # Output head (token prediction) - cast to float32 for loss computation
-        self.head = layers.Dense(config.vocab_size, name="head", dtype=tf.float32)
-    
-        # Initialize tokenizer if transformers is available
-        self.tokenizer = None
-        if HAS_TRANSFORMERS and GPT2TokenizerClass is not None:
-            try:
-                self.tokenizer = GPT2TokenizerClass.from_pretrained('gpt2')
-                if self.tokenizer is not None:
-                    logger.info("Successfully initialized GPT2Tokenizer")
-                else:
-                    logger.warning("Tokenizer initialization returned None")
-            except Exception as e:
-                logger.warning(f"Failed to initialize tokenizer: {str(e)}")
-                self.tokenizer = None
+        # Output projection
+        self.output_projection = layers.Dense(
+            self.config.vocab_size,
+            name="output_projection"
+        )
+        
+    def call(self, inputs, training=False):
+        """Forward pass of the model."""
+        if isinstance(inputs, dict):
+            input_ids = inputs['input_ids']
         else:
-            logger.warning("Transformers library not available, tokenizer not initialized")
-    
-    def call(self, inputs, training=False, mask=None):
-        # Cast inputs to int32 for embedding lookup
-        inputs = tf.cast(inputs, tf.int32)
+            input_ids = inputs
+            
+        # Get sequence length
+        seq_len = tf.shape(input_ids)[1]
         
         # Get embeddings
-        x = self.token_emb(inputs)  # [batch_size, seq_len, embed_dim]
+        token_embeddings = self.token_embedding(input_ids)
         
-        # Positional embeddings
-        positions = tf.range(tf.shape(inputs)[1], dtype=tf.int32)
-        positions = tf.expand_dims(positions, 0)
-        positions = tf.tile(positions, [tf.shape(inputs)[0], 1])
-        pos_emb = self.pos_emb(positions)
+        # Add positional embeddings
+        if self.config.use_rotary_embeddings:
+            token_embeddings = self.pos_embedding(token_embeddings)
+        else:
+            positions = tf.range(seq_len, dtype=tf.int32)
+            position_embeddings = self.pos_embedding(positions)
+            token_embeddings = token_embeddings + position_embeddings
         
-        # CRITICAL: Ensure both embeddings are float16 before addition
-        x = tf.cast(x, tf.float16) + tf.cast(pos_emb, tf.float16)
-        
-        # Transformer blocks - ensure float16 throughout
+        # Apply transformer blocks
+        x = token_embeddings
         for block in self.transformer_blocks:
-            x = block(tf.cast(x, tf.float16), training=training)
-            x = tf.cast(x, tf.float16)  # Ensure output is float16
+            x = block(x, training=training)
         
-        # Layer normalization
-        x = self.ln_f(tf.cast(x, tf.float16))
+        # Final layer norm
+        x = self.final_layer_norm(x)
         
-        # CRITICAL: Cast to float32 for output head
-        x_float32 = tf.cast(x, tf.float32)
-        logits = self.head(x_float32)
+        # Output projection
+        logits = self.output_projection(x)
         
         return logits
-    
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            'vocab_size': self.config.vocab_size,
-            'max_seq_len': self.config.max_seq_len,
-            'embed_dim': self.config.embed_dim,
-            'num_heads': self.config.num_heads,
-            'num_layers': self.config.num_layers,
-            'ffn_dim': self.config.ffn_dim,
-            'dropout': self.config.dropout,
-            'layer_norm_epsilon': self.config.layer_norm_epsilon,
-            'use_custom_attention': self.config.use_custom_attention,
-            'use_rotary_embeddings': self.config.use_rotary_embeddings
-        })
-        return config
+        
+    def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7,
+                top_k: int = 50, top_p: float = 0.9, **kwargs):
+        """Generate text using the model."""
+        batch_size = tf.shape(input_ids)[0]
+        current_length = tf.shape(input_ids)[1]
+        
+        # Initialize output sequence
+        output_sequence = input_ids
+        
+        # Generate tokens
+        for _ in range(max_length):
+            # Get model predictions
+            logits = self(output_sequence, training=False)
+            next_token_logits = logits[:, -1, :]
+            
+            # Apply temperature
+            next_token_logits = next_token_logits / temperature
+            
+            # Apply top-k filtering
+            if top_k > 0:
+                indices_to_remove = next_token_logits < tf.math.top_k(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits = tf.where(indices_to_remove, tf.ones_like(next_token_logits) * -float('inf'), next_token_logits)
+            
+            # Apply top-p (nucleus) filtering
+            if top_p < 1.0:
+                sorted_logits = tf.sort(next_token_logits, direction='DESCENDING')
+                sorted_indices = tf.argsort(next_token_logits, direction='DESCENDING')
+                cumulative_probs = tf.cumsum(tf.nn.softmax(sorted_logits, axis=-1), axis=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove = tf.concat([tf.zeros_like(sorted_indices_to_remove[:, :1]), sorted_indices_to_remove[:, :-1]], axis=-1)
+                indices_to_remove = tf.batch_gather(sorted_indices_to_remove, sorted_indices)
+                next_token_logits = tf.where(indices_to_remove, tf.ones_like(next_token_logits) * -float('inf'), next_token_logits)
+            
+            # Sample next token
+            probs = tf.nn.softmax(next_token_logits, axis=-1)
+            next_token = tf.random.categorical(probs, num_samples=1)
+            
+            # Append to output sequence
+            output_sequence = tf.concat([output_sequence, next_token], axis=1)
+            
+            # Check if we should stop
+            if tf.reduce_any(next_token == self.config.vocab_size - 1):  # EOS token
+                break
+        
+        return output_sequence
+        
+    def generate_text(self, prompt: str, max_length: int = 100, temperature: float = 0.7):
+        """Generate text from a string prompt (requires tokenizer)"""
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not available. Please install transformers package.")
+            
+        # Tokenize input
+        input_ids = self.tokenizer.encode(prompt, return_tensors='tf')
+        
+        # Generate
+        output_ids = self.generate(input_ids, max_length=max_length, temperature=temperature)
+        
+        # Decode output
+        output_text = self.tokenizer.decode(output_ids[0].numpy())
+        
+        return output_text
+        
+    def chat(self, message: str, max_length: int = 100, temperature: float = 0.7) -> str:
+        """Chat with the model (requires tokenizer)"""
+        if self.tokenizer is None:
+            raise ValueError("Tokenizer not available. Please install transformers package.")
+            
+        # Format message
+        prompt = f"Human: {message}\nAI:"
+        
+        # Generate response
+        response = self.generate_text(prompt, max_length=max_length, temperature=temperature)
+        
+        # Extract AI response
+        try:
+            response = response.split("AI:")[-1].strip()
+        except:
+            response = response.strip()
+            
+        return response
+        
+    def compute_loss(self, input_ids, labels=None):
+        """Compute the loss for training."""
+        if labels is None:
+            labels = input_ids[:, 1:]
+            input_ids = input_ids[:, :-1]
+            
+        # Get model predictions
+        logits = self(input_ids, training=True)
+        
+        # Compute loss
+        loss = tf.keras.losses.sparse_categorical_crossentropy(
+            labels, logits, from_logits=True
+        )
+        
+        return tf.reduce_mean(loss)
 
-# Export all necessary classes
-__all__ = [
-    'ModelConfig',
-    'EnhancedMiniGPT',
-    'CustomMultiHeadAttention',
-    'MultiHeadAttention',
-    'RotaryPositionalEmbedding',
-    'FeedForward',
-    'TransformerBlock',
-    'create_dense_float16'
-]
+    def benchmark_speed(self, batch_sizes=[1, 2, 4, 8], seq_lengths=[128, 256, 512]) -> Dict:
+        """Benchmark model speed with different batch sizes and sequence lengths."""
+        results = {}
+        
+        for batch_size in batch_sizes:
+            for seq_len in seq_lengths:
+                key = f"batch_{batch_size}_seq_{seq_len}"
+                
+                # Create dummy input
+                input_ids = tf.random.uniform(
+                    (batch_size, seq_len),
+                    minval=0,
+                    maxval=self.config.vocab_size,
+                    dtype=tf.int32
+                )
+                
+                # Warmup
+                for _ in range(3):
+                    _ = self(input_ids, training=False)
+                
+                # Benchmark
+                num_runs = 10
+                start_time = time.time()
+                
+                for _ in range(num_runs):
+                    _ = self(input_ids, training=False)
+                
+                elapsed = time.time() - start_time
+                
+                # Calculate metrics
+                tokens_per_second = (batch_size * seq_len * num_runs) / elapsed
+                
+                results[key] = {
+                    "tokens_per_second": tokens_per_second,
+                    "batch_size": batch_size,
+                    "seq_len": seq_len,
+                    "elapsed_time": elapsed
+                }
+        
+        return results

@@ -7,8 +7,6 @@ import json
 from pathlib import Path
 import datasets
 from datasets import disable_caching
-import time
-from tqdm import tqdm
 from minigpt_transformer import (
     EnhancedMiniGPT,
     ModelConfig,
@@ -23,83 +21,254 @@ from minigpt_transformer import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class TrainingMetrics:
-    """Class to track and display training metrics."""
-    def __init__(self):
-        self.reset()
-    
-    def reset(self):
-        self.losses = []
-        self.accuracies = []
-        self.perplexities = []
-        self.start_time = time.time()
-    
-    def update(self, loss, accuracy):
-        self.losses.append(loss)
-        self.accuracies.append(accuracy)
-        perplexity = np.exp(min(loss, 10))  # Cap to prevent overflow
-        self.perplexities.append(perplexity)
-    
-    def get_averages(self):
-        if not self.losses:
-            return 0.0, 0.0, 0.0
-        return np.mean(self.losses), np.mean(self.accuracies), np.mean(self.perplexities)
-    
-    def get_current(self):
-        if not self.losses:
-            return 0.0, 0.0, 0.0
-        return self.losses[-1], self.accuracies[-1], self.perplexities[-1]
-
-def create_dummy_dataset(vocab_size: int = 50257, seq_len: int = 128, batch_size: int = 2, num_samples: int = 1000):
-    """Create a dummy dataset for testing with proper batching and infinite repeat."""
+def create_dummy_dataset(vocab_size=50257, seq_len=512, batch_size=1, num_samples=1000):  # Changed from 8 to 1
+    """Create a dummy dataset for testing"""
     def data_generator():
-        while True:  # Make the generator infinite
+        for _ in range(num_samples):
             # Generate random input sequence
-            input_ids = np.random.randint(0, vocab_size, size=(seq_len,), dtype=np.int32)
-            yield input_ids
+            input_seq = np.random.randint(0, vocab_size, size=seq_len, dtype=np.int32)
+            yield {'input_ids': input_seq}
     
     # Create dataset
     dataset = tf.data.Dataset.from_generator(
         data_generator,
-        output_signature=tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
+        output_signature={
+            'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
+        }
     )
     
-    # Batch and prefetch
-    dataset = dataset.batch(batch_size, drop_remainder=True)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    
-    return dataset
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-def create_text_dataset(texts, tokenizer, seq_len=512, batch_size=8):
-    """Create an infinite dataset from texts."""
-    if not texts or not tokenizer:
-        logger.warning("No texts or tokenizer provided")
-        return None
-        
+def create_text_dataset(text_file_path, tokenizer, seq_len=512, batch_size=1):  # Changed from 8 to 1
+    """Create a dataset from a text file."""
     def data_generator():
-        while True:  # Make the generator infinite
-            for text in texts:
-                if not isinstance(text, str) or len(text.strip()) == 0:
+        with open(text_file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                # Tokenize text
+                tokens = tokenizer.encode(line.strip())
+                if len(tokens) < seq_len:
+                    continue
+                
+                # Create sequences with overlap
+                for i in range(0, len(tokens) - seq_len, seq_len // 2):
+                    yield {'input_ids': tokens[i:i + seq_len]}
+    
+    # Create dataset
+    dataset = tf.data.Dataset.from_generator(
+        data_generator,
+        output_signature={
+            'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
+        }
+    )
+    
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+class CustomModelCheckpoint(tf.keras.callbacks.Callback):
+    """Custom checkpoint callback that saves both weights and full model"""
+    
+    def __init__(self, filepath, save_weights_only=False, save_best_only=False, 
+                 monitor='loss', mode='min', save_freq='epoch', verbose=1):
+        super().__init__()
+        self.filepath = filepath
+        self.save_weights_only = save_weights_only
+        self.save_best_only = save_best_only
+        self.monitor = monitor
+        self.mode = mode
+        self.save_freq = save_freq
+        self.verbose = verbose
+        
+        if mode == 'min':
+            self.best = float('inf')
+            self.monitor_op = np.less
+        else:
+            self.best = -float('inf')
+            self.monitor_op = np.greater
+    
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        
+        # Format filepath - Fix the formatting issue
+        try:
+            filepath = self.filepath.format(epoch=epoch + 1, **logs)
+        except (KeyError, ValueError) as e:
+            # Fallback to simple epoch-based naming
+            filepath = f"{self.filepath}_epoch_{epoch + 1:02d}"
+        
+        # Check if we should save
+        current = logs.get(self.monitor)
+        if current is None:
+            if self.verbose > 0:
+                logger.warning(f"Can't find {self.monitor} in logs")
+            return
+        
+        if self.save_best_only:
+            if self.monitor_op(current, self.best):
+                self.best = current
+            else:
+                return
+        
+        try:
+            if self.save_weights_only:
+                # Ensure .weights.h5 extension
+                if not filepath.endswith('.weights.h5'):
+                    filepath = filepath + '.weights.h5'
+                self.model.save_weights(filepath, save_format='h5')
+            else:
+                # Save full model
+                if not filepath.endswith('.keras'):
+                    filepath = filepath + '.keras'
+                self.model.save(filepath, save_format='keras')
+            
+            if self.verbose > 0:
+                logger.info(f"Saved model at epoch {epoch + 1}: {filepath}")
+                
+        except Exception as e:
+            logger.error(f"Failed to save model: {e}")
+
+def setup_callbacks(checkpoint_dir="./checkpoints", monitor='loss'):
+    """Setup training callbacks"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    callbacks = [
+        # Custom checkpoint callback
+        CustomModelCheckpoint(
+            filepath=os.path.join(checkpoint_dir, "minigpt_epoch_{epoch:02d}"),
+            save_weights_only=True,
+            save_best_only=True,
+            monitor=monitor,
+            mode='min',
+            verbose=1
+        ),
+        
+        # Early stopping
+        tf.keras.callbacks.EarlyStopping(
+            monitor=monitor,
+            patience=5,
+            restore_best_weights=True,
+            verbose=1
+        ),
+        
+        # Reduce learning rate on plateau
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor=monitor,
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
+            verbose=1
+        ),
+        
+        # TensorBoard logging
+        tf.keras.callbacks.TensorBoard(
+            log_dir=os.path.join(checkpoint_dir, "logs"),
+            histogram_freq=1,
+            write_graph=True,
+            update_freq='epoch'
+        ),
+        
+        # CSV logger
+        tf.keras.callbacks.CSVLogger(
+            os.path.join(checkpoint_dir, "training_log.csv"),
+            append=True
+        )
+    ]
+    
+    return callbacks
+
+def load_conversation_datasets():
+    """Load conversation datasets from HuggingFace."""
+    disable_caching()
+    
+    # Define datasets to load
+    dataset_configs = [
+        ("conv_ai_2", None),  # Use None for default config
+        ("blended_skill_talk", None),
+        ("daily_dialog", None)
+    ]
+    
+    all_texts = []
+    
+    for dataset_name, config_name in dataset_configs:
+        try:
+            # Load dataset
+            if config_name:
+                dataset = datasets.load_dataset(dataset_name, config_name, split="train")
+            else:
+                dataset = datasets.load_dataset(dataset_name, split="train")
+            logger.info(f"Loaded {dataset_name} dataset")
+            
+            # Extract conversations
+            texts = []
+            for example in dataset:
+                if isinstance(example, dict):
+                    # Handle different dataset formats
+                    if "dialog" in example:
+                        dialog = example["dialog"]
+                        if isinstance(dialog, list):
+                            texts.extend([str(turn) for turn in dialog])
+                    elif "conversation" in example:
+                        conv = example["conversation"]
+                        if isinstance(conv, list):
+                            texts.extend([str(turn) for turn in conv])
+                    elif "text" in example:
+                        texts.append(str(example["text"]))
+                    elif "free_messages" in example:
+                        messages = example["free_messages"]
+                        if isinstance(messages, list):
+                            texts.extend([str(msg) for msg in messages])
+                    elif "utterances" in example:
+                        utterances = example["utterances"]
+                        if isinstance(utterances, list):
+                            texts.extend([str(utt) for utt in utterances])
+            
+            all_texts.extend(texts)
+            logger.info(f"Added {len(texts)} texts from {dataset_name}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to load {dataset_name}: {e}")
+    
+    return all_texts
+
+def create_dataset_from_texts(texts, tokenizer, seq_len, batch_size = 1):
+    """Create a TensorFlow dataset from a list of texts."""
+    try:
+        if not texts:
+            logger.warning("No texts provided for dataset creation")
+            return None
+            
+        # Filter out non-string texts and empty strings
+        texts = [str(text).strip() for text in texts if text and str(text).strip()]
+        if not texts:
+            logger.warning("No valid texts after filtering")
+            return None
+            
+        # Create sequences
+        sequences = []
+        for text in texts:
+            try:
+                # Tokenize text
+                tokens = tokenizer.encode(text)
+                if not tokens or len(tokens) < 2:  # Need at least 2 tokens
                     continue
                     
-                try:
-                    tokens = tokenizer.encode(text.strip())
-                    stride = seq_len // 2
-                    for i in range(0, len(tokens) - seq_len + 1, stride):
-                        sequence = tokens[i:i + seq_len]
-                        if len(sequence) == seq_len:
-                            yield np.array(sequence, dtype=np.int32)
-                except Exception as e:
-                    logger.warning(f"Error processing text: {e}")
-                    continue
-    
-    try:
-        dataset = tf.data.Dataset.from_generator(
-            data_generator,
-            output_signature=tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
-        )
+                # Create overlapping sequences of length seq_len
+                for i in range(0, len(tokens) - seq_len + 1, seq_len // 2):
+                    sequence = tokens[i:i + seq_len]
+                    if len(sequence) == seq_len:  # Only add complete sequences
+                        sequences.append(sequence)
+            except Exception as e:
+                logger.warning(f"Error processing text: {e}")
+                continue
         
-        dataset = dataset.batch(batch_size, drop_remainder=True)
+        if not sequences:
+            logger.warning("No valid sequences created from texts")
+            return None
+            
+        logger.info(f"Created {len(sequences)} sequences from {len(texts)} texts")
+        
+        # Convert to TensorFlow dataset
+        dataset = tf.data.Dataset.from_tensor_slices(sequences)
+        dataset = dataset.map(lambda x: {'input_ids': x})
+        dataset = dataset.batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
         dataset = dataset.prefetch(tf.data.AUTOTUNE)
         
         return dataset
@@ -107,622 +276,304 @@ def create_text_dataset(texts, tokenizer, seq_len=512, batch_size=8):
         logger.error(f"Error creating dataset: {e}")
         return None
 
-def load_conversation_datasets():
-    """Load conversation datasets with improved error handling and fallback strategies."""
-    # Clear cache directory and disable caching completely
-    try:
-        import shutil
-        cache_dir = os.path.expanduser("~/.cache/huggingface/datasets")
-        if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            logger.info("Cleared HuggingFace cache directory")
-    except Exception as e:
-        logger.warning(f"Could not clear cache directory: {e}")
-    
-    # Disable all caching mechanisms
-    disable_caching()
-    datasets.config.HF_DATASETS_OFFLINE = False
-    datasets.config.USE_AUTH_TOKEN = False
-    
-    # Set environment variables to prevent caching issues
-    os.environ['HF_DATASETS_OFFLINE'] = '0'
-    os.environ['HF_DATASETS_CACHE'] = '/tmp/hf_cache'
-    
-    # Simplified dataset configs with better fallback
-    dataset_configs = [
-        ("blended_skill_talk", "dialog"),
-        ("daily_dialog", "dialogue")
-    ]
-    
-    all_texts = []
-    max_texts = 5000  # Reduced for faster loading
-    
-    for dataset_name, field_name in dataset_configs:
-        try:
-            logger.info(f"Attempting to load {dataset_name}...")
-            
-            # Try the most reliable loading strategy first
-            dataset = None
-            
-            try:
-                # Strategy 1: Simple load with minimal configuration
-                dataset = datasets.load_dataset(
-                    dataset_name,
-                    split="train",
-                    trust_remote_code=True,
-                    verification_mode="no_checks"
-                )
-                
-                # Take only first 1000 samples to avoid memory issues
-                if len(dataset) > 1000:
-                    dataset = dataset.select(range(1000))
-                    
-                logger.info(f"Successfully loaded {dataset_name} with simple strategy")
-                
-            except Exception as e1:
-                logger.warning(f"Simple strategy failed for {dataset_name}: {e1}")
-                
-                # Strategy 2: Try with different split configurations
-                try:
-                    # Try different split names
-                    possible_splits = ['train', 'training', 'dialogue']
-                    full_dataset = datasets.load_dataset(
-                        dataset_name,
-                        trust_remote_code=True,
-                        verification_mode="no_checks"
-                    )
-                    
-                    dataset = None
-                    for split_name in possible_splits:
-                        if hasattr(full_dataset, split_name):
-                            split_data = getattr(full_dataset, split_name)
-                            if split_data is not None:
-                                dataset = split_data.select(range(min(1000, len(split_data))))
-                                logger.info(f"Successfully loaded {dataset_name} using split '{split_name}'")
-                                break
-                    
-                    if dataset is None:
-                        # Try to get any available split
-                        available_splits = list(full_dataset.keys()) if hasattr(full_dataset, 'keys') else []
-                        if available_splits:
-                            first_split = full_dataset[available_splits[0]]
-                            dataset = first_split.select(range(min(1000, len(first_split))))
-                            logger.info(f"Successfully loaded {dataset_name} using first available split")
-                    
-                except Exception as e2:
-                    logger.warning(f"Split strategy failed for {dataset_name}: {e2}")
-                    continue
-            
-            # Process the dataset if we successfully loaded it
-            if dataset is not None:
-                try:
-                    logger.info(f"Processing {len(dataset)} examples from {dataset_name}")
-                    
-                    # Extract text based on dataset structure
-                    for i, example in enumerate(dataset):
-                        if i % 100 == 0:
-                            logger.info(f"Processing example {i}/{len(dataset)} from {dataset_name}")
-                            
-                        text_content = None
-                        
-                        # Try different field access patterns
-                        if field_name in example:
-                            if isinstance(example[field_name], list):
-                                # Handle list of dialogue turns
-                                text_content = " ".join([str(turn) for turn in example[field_name] if turn])
-                            elif isinstance(example[field_name], str):
-                                text_content = example[field_name]
-                        elif 'text' in example:
-                            text_content = example['text']
-                        elif 'conversation' in example:
-                            if isinstance(example['conversation'], list):
-                                text_content = " ".join([str(turn) for turn in example['conversation'] if turn])
-                            else:
-                                text_content = str(example['conversation'])
-                        elif 'utterances' in example:
-                            if isinstance(example['utterances'], list):
-                                text_content = " ".join([str(utt) for utt in example['utterances'] if utt])
-                        
-                        # Clean and validate text
-                        if text_content:
-                            text_content = text_content.strip()
-                            if len(text_content) > 20:  # Minimum length requirement
-                                all_texts.append(text_content)
-                                if len(all_texts) >= max_texts:
-                                    break
-                    
-                    logger.info(f"Successfully extracted {len(all_texts)} texts from {dataset_name}")
-                    
-                except Exception as e:
-                    logger.warning(f"Error processing {dataset_name}: {e}")
-                    continue
-            else:
-                logger.warning(f"Could not load {dataset_name} with any strategy")
-                
-        except Exception as e:
-            logger.warning(f"Failed to load {dataset_name}: {e}")
-            continue
-    
-    # Add comprehensive fallback data if insufficient texts were loaded
-    if len(all_texts) < 100:
-        logger.warning(f"Only {len(all_texts)} texts loaded from datasets, adding fallback data")
-        fallback_texts = [
-            "Hello, how are you today? I'm doing well, thank you for asking. What about you?",
-            "What's your favorite color? I like blue because it reminds me of the sky and ocean.",
-            "Do you enjoy reading books? Yes, I love reading science fiction and fantasy novels.",
-            "What do you think about artificial intelligence? It's a fascinating field with lots of potential for helping people.",
-            "How do you spend your free time? I enjoy hiking, reading, cooking, and learning new programming languages.",
-            "Tell me about your day. It's been productive and interesting, I've learned several new things today.",
-            "What's the weather like today? It's sunny and warm, perfect for outdoor activities and spending time in nature.",
-            "Do you have any hobbies? I enjoy photography, cooking, playing musical instruments, and gardening.",
-            "What's your favorite type of music? I appreciate various genres, from classical to jazz to contemporary rock.",
-            "Can you recommend a good restaurant? There's a lovely Italian place downtown that serves amazing pasta dishes.",
-            "What are your plans for the weekend? I'm thinking of visiting a museum and then having dinner with friends.",
-            "Do you like to travel? Yes, I find exploring new places and cultures very enriching and educational.",
-            "What's your favorite season? I love autumn because of the beautiful colors and crisp, fresh air.",
-            "Do you prefer movies or books? Both have their merits, but I lean slightly towards books for their depth.",
-            "What's the most interesting thing you've learned recently? I've been fascinated by advances in renewable energy technology.",
-            "How do you stay motivated? I find setting small, achievable goals helps maintain momentum and progress.",
-            "What's your opinion on social media? It's a powerful tool for connection but requires mindful and balanced usage.",
-            "Do you have any pets? I have a cat named Whiskers who's quite playful and brings joy to everyday life.",
-            "What's your favorite type of cuisine? I enjoy Mediterranean food for its fresh ingredients and healthy flavors.",
-            "How do you handle stress? I find meditation, regular exercise, and talking to friends very helpful for managing stress and anxiety.",
-            "What's your dream job? I'd love to work in a field that combines creativity with technology to solve meaningful problems.",
-            "What book are you currently reading? I'm reading a fascinating book about the history of human civilization and cultural development.",
-            "What's your favorite way to exercise? I enjoy a mix of cardio activities like running and strength training at the gym.",
-            "How do you learn new skills? I prefer a combination of online courses, practical projects, and learning from experienced mentors.",
-            "What's your favorite holiday? I love the winter holidays because they bring families together and create warm, memorable experiences."
-        ]
-        # Duplicate fallback texts to have sufficient training data
-        multiplier = max(1, (max_texts - len(all_texts)) // len(fallback_texts) + 1)
-        all_texts.extend(fallback_texts * multiplier)
-    
-    # Ensure we don't exceed the maximum
-    all_texts = all_texts[:max_texts]
-    logger.info(f"Total texts available for training: {len(all_texts)}")
-    return all_texts
-
 def train_model(model, config):
-    """Enhanced training function with comprehensive progress tracking and metrics display."""
-    # Enable mixed precision
-    policy = tf.keras.mixed_precision.Policy('mixed_float16')
-    tf.keras.mixed_precision.set_global_policy(policy)
-    
-    # Create optimizer
+    """Train the model."""
+    # Create optimizer with gradient clipping
     optimizer = tf.keras.optimizers.Adam(
         learning_rate=config.learning_rate,
         beta_1=0.9,
         beta_2=0.999,
         epsilon=1e-8,
-        clipnorm=1.0
+        clipnorm=1.0  # Add gradient clipping
     )
-    optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+    
+    # Create metrics
+    train_loss = tf.keras.metrics.Mean(name='train_loss')
+    train_perplexity = tf.keras.metrics.Mean(name='train_perplexity')
+    train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+    val_loss = tf.keras.metrics.Mean(name='val_loss')
+    val_perplexity = tf.keras.metrics.Mean(name='val_perplexity')
+    val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
     
     # Create loss function
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
     
-    # Training step with better error handling
+    # Define training step - Fixed shape handling
     @tf.function
-    def train_step(input_batch):
+    def train_step(batch):
+        input_ids = batch['input_ids']
+        
         # Create input and target sequences
-        input_ids = input_batch[:, :-1]  # All tokens except the last
-        targets = input_batch[:, 1:]     # All tokens except the first
+        inputs = input_ids[:, :-1]  # All tokens except the last one
+        targets = input_ids[:, 1:]  # All tokens except the first one
         
         with tf.GradientTape() as tape:
             # Forward pass
-            logits = model(input_ids, training=True)
+            logits = model(inputs, training=True)
             
-            # Reshape for loss computation
-            batch_size = tf.shape(logits)[0]
-            seq_len = tf.shape(logits)[1]
-            vocab_size = tf.shape(logits)[2]
+            # Compute loss - ensure shapes match
+            batch_size = tf.shape(targets)[0]
+            seq_len = tf.shape(targets)[1]
             
-            logits_flat = tf.reshape(logits, [-1, vocab_size])
+            # Flatten targets for loss computation
             targets_flat = tf.reshape(targets, [-1])
+            logits_flat = tf.reshape(logits, [-1, tf.shape(logits)[-1]])
             
             # Compute loss
             loss_per_token = loss_fn(targets_flat, logits_flat)
             loss = tf.reduce_mean(loss_per_token)
             
-            # Scale loss for mixed precision
-            scaled_loss = optimizer.get_scaled_loss(loss)
+            # Add regularization losses
+            if model.losses:
+                loss += tf.reduce_sum(model.losses)
         
         # Compute gradients
-        scaled_gradients = tape.gradient(scaled_loss, model.trainable_variables)
-        gradients = optimizer.get_unscaled_gradients(scaled_gradients)
-        
-        # Check for NaN gradients
-        finite_gradients = []
-        for grad in gradients:
-            if grad is not None:
-                finite_gradients.append(tf.where(tf.math.is_finite(grad), grad, tf.zeros_like(grad)))
-            else:
-                finite_gradients.append(None)
+        gradients = tape.gradient(loss, model.trainable_variables)
         
         # Apply gradients
-        optimizer.apply_gradients(zip(finite_gradients, model.trainable_variables))
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         
-        # Calculate accuracy
-        predictions = tf.argmax(logits_flat, axis=-1)
-        accuracy = tf.reduce_mean(tf.cast(tf.equal(targets_flat, tf.cast(predictions, targets_flat.dtype)), tf.float32))
+        # Update metrics
+        train_loss.update_state(loss)
+        train_perplexity.update_state(tf.exp(tf.minimum(loss, 10.0)))  # Cap to prevent overflow
+        train_accuracy.update_state(targets, logits)
         
-        return loss, accuracy
+        return loss
     
-    # Create datasets
-    logger.info("Creating datasets...")
+    # Define validation step - Fixed shape handling
+    @tf.function
+    def val_step(batch):
+        input_ids = batch['input_ids']
+        
+        # Create input and target sequences
+        inputs = input_ids[:, :-1]
+        targets = input_ids[:, 1:]
+        
+        # Forward pass
+        logits = model(inputs, training=False)
+        
+        # Compute loss
+        targets_flat = tf.reshape(targets, [-1])
+        logits_flat = tf.reshape(logits, [-1, tf.shape(logits)[-1]])
+        
+        loss_per_token = loss_fn(targets_flat, logits_flat)
+        loss = tf.reduce_mean(loss_per_token)
+        
+        # Update metrics
+        val_loss.update_state(loss)
+        val_perplexity.update_state(tf.exp(tf.minimum(loss, 10.0)))
+        val_accuracy.update_state(targets, logits)
+        
+        return loss
     
-    # Try to load conversation data
-    texts = load_conversation_datasets()
-    
-    if hasattr(model, 'tokenizer') and model.tokenizer is not None:
-        logger.info("Using tokenizer to create dataset from texts")
-        train_dataset = create_text_dataset(texts, model.tokenizer, config.seq_len, config.batch_size)
-        val_dataset = create_text_dataset(texts[-100:], model.tokenizer, config.seq_len, config.batch_size)
-    else:
-        logger.info("No tokenizer available, using dummy dataset")
-        train_dataset = None
-        val_dataset = None
-    
-    # Fallback to dummy dataset
-    if train_dataset is None:
-        logger.info("Creating dummy datasets")
-        train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, 1000)
-        val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, 100)
-    
-    # Create checkpoint directory
+    # Create checkpoint
     checkpoint_dir = './checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+    checkpoint = tf.train.Checkpoint(optimizer=optimizer, model=model)
     
-    # Training parameters
-    num_epochs = 5
-    steps_per_epoch = 100
-    validation_steps = 20
+    # Create summary writers
+    train_log_dir = './logs/train'
+    val_log_dir = './logs/val'
+    os.makedirs(train_log_dir, exist_ok=True)
+    os.makedirs(val_log_dir, exist_ok=True)
+    train_summary_writer = tf.summary.create_file_writer(train_log_dir)
+    val_summary_writer = tf.summary.create_file_writer(val_log_dir)
     
-    # Initialize metrics tracking
-    train_metrics = TrainingMetrics()
-    val_metrics = TrainingMetrics()
+    # Load datasets
+    logger.info("Loading conversation datasets...")
+    texts = load_conversation_datasets()
     
-    # Training history for plotting
-    training_history = {
-        'epoch': [],
-        'train_loss': [],
-        'train_accuracy': [],
-        'train_perplexity': [],
-        'val_loss': [],
-        'val_accuracy': [],
-        'val_perplexity': []
-    }
-    
-    logger.info("🚀 STARTING TRAINING")
-    logger.info("=" * 80)
-    logger.info(f"📊 Configuration:")
-    logger.info(f"   • Epochs: {num_epochs}")
-    logger.info(f"   • Steps per epoch: {steps_per_epoch}")
-    logger.info(f"   • Batch size: {config.batch_size}")
-    logger.info(f"   • Learning rate: {config.learning_rate}")
-    logger.info(f"   • Model parameters: {model.count_params():,}")
-    logger.info("=" * 80)
-    
-    # Global training start time
-    global_start_time = time.time()
+    # Check if we have a tokenizer
+    if not hasattr(model, 'tokenizer') or model.tokenizer is None:
+        logger.warning("No tokenizer available, using dummy dataset")
+        train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+        val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
+    else:
+        # Create datasets
+        if texts:
+            dataset = create_dataset_from_texts(texts, model.tokenizer, config.seq_len, config.batch_size)
+            if dataset is None:
+                logger.warning("Failed to create dataset from texts, using dummy dataset")
+                train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+                val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
+            else:
+                # Split into train and validation
+                dataset_list = list(dataset)
+                total_size = len(dataset_list)
+                train_size = int(0.9 * total_size)
+                
+                train_dataset = tf.data.Dataset.from_tensor_slices(dataset_list[:train_size])
+                val_dataset = tf.data.Dataset.from_tensor_slices(dataset_list[train_size:])
+                
+                # Rebatch the datasets
+                train_dataset = train_dataset.unbatch().batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
+                val_dataset = val_dataset.unbatch().batch(config.batch_size).prefetch(tf.data.AUTOTUNE)
+        else:
+            logger.warning("No texts loaded, using dummy dataset")
+            train_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size)
+            val_dataset = create_dummy_dataset(config.vocab_size, config.seq_len, config.batch_size, num_samples=100)
     
     # Training loop
+    num_epochs = 10
+    step_count = 0
+    
     for epoch in range(num_epochs):
-        epoch_start_time = time.time()
+        logger.info(f"Epoch {epoch + 1}/{num_epochs}")
         
-        print(f"\n{'='*60}")
-        print(f"🎯 EPOCH {epoch + 1}/{num_epochs}")
-        print(f"{'='*60}")
+        # Reset metrics
+        train_loss.reset_state()
+        train_perplexity.reset_state()
+        train_accuracy.reset_state()
+        val_loss.reset_state()
+        val_perplexity.reset_state()
+        val_accuracy.reset_state()
         
-        # Reset metrics for this epoch
-        train_metrics.reset()
-        
-        # Training phase with progress bar
-        train_iter = iter(train_dataset)
-        
-        print("📈 Training Phase:")
-        train_pbar = tqdm(range(steps_per_epoch), desc="Training", ncols=100)
-        
-        for step in train_pbar:
-            try:
-                batch = next(train_iter)
-                if batch.shape[0] < config.batch_size:
+        # Training
+        try:
+            batch_count = 0
+            for batch in train_dataset:
+                if batch is None:
                     continue
                     
-                loss, accuracy = train_step(batch)
+                input_ids = batch['input_ids']
+                if input_ids is None or tf.size(input_ids) == 0:
+                    continue
                 
-                # Update metrics
-                train_metrics.update(float(loss.numpy()), float(accuracy.numpy()))
+                # Ensure input has enough tokens
+                if tf.shape(input_ids)[1] < 2:
+                    continue
                 
-                # Update progress bar with current metrics
-                current_loss, current_acc, current_perp = train_metrics.get_current()
-                avg_loss, avg_acc, avg_perp = train_metrics.get_averages()
+                # Train step
+                loss = train_step(batch)
+                step_count += 1
+                batch_count += 1
                 
-                train_pbar.set_postfix({
-                    'Loss': f'{current_loss:.4f}',
-                    'Acc': f'{current_acc:.3f}',
-                    'Perp': f'{current_perp:.2f}',
-                    'Avg_Loss': f'{avg_loss:.4f}'
-                })
-                
-            except (StopIteration, tf.errors.OutOfRangeError):
-                train_iter = iter(train_dataset)
-                continue
-            except Exception as e:
-                logger.error(f"Error in training step {step}: {e}")
-                continue
-        
-        train_pbar.close()
-        
-        # Validation phase with progress bar
-        val_metrics.reset()
-        val_iter = iter(val_dataset)
-        
-        print("📊 Validation Phase:")
-        val_pbar = tqdm(range(validation_steps), desc="Validation", ncols=100)
-        
-        for step in val_pbar:
-            try:
-                batch = next(val_iter)
-                
-                # Validation forward pass
-                input_ids = batch[:, :-1]
-                targets = batch[:, 1:]
-                
-                logits = model(input_ids, training=False)
-                
-                # Compute validation loss and accuracy
-                batch_size = tf.shape(logits)[0]
-                seq_len = tf.shape(logits)[1]
-                vocab_size = tf.shape(logits)[2]
-                
-                logits_flat = tf.reshape(logits, [-1, vocab_size])
-                targets_flat = tf.reshape(targets, [-1])
-                
-                val_loss = tf.reduce_mean(loss_fn(targets_flat, logits_flat))
-                predictions = tf.argmax(logits_flat, axis=-1)
-                val_accuracy = tf.reduce_mean(tf.cast(tf.equal(targets_flat, tf.cast(predictions, targets_flat.dtype)), tf.float32))
-                
-                # Update metrics
-                val_metrics.update(float(val_loss.numpy()), float(val_accuracy.numpy()))
-                
-                # Update progress bar
-                current_loss, current_acc, current_perp = val_metrics.get_current()
-                avg_loss, avg_acc, avg_perp = val_metrics.get_averages()
-                
-                val_pbar.set_postfix({
-                    'Loss': f'{current_loss:.4f}',
-                    'Acc': f'{current_acc:.3f}',
-                    'Perp': f'{current_perp:.2f}',
-                    'Avg_Loss': f'{avg_loss:.4f}'
-                })
-                
-            except (StopIteration, tf.errors.OutOfRangeError):
-                val_iter = iter(val_dataset)
-                continue
-            except Exception as e:
-                logger.error(f"Error in validation step {step}: {e}")
-                continue
-        
-        val_pbar.close()
-        
-        # Calculate epoch metrics
-        train_loss, train_acc, train_perp = train_metrics.get_averages()
-        val_loss, val_acc, val_perp = val_metrics.get_averages()
-        
-        # Store metrics in history
-        training_history['epoch'].append(epoch + 1)
-        training_history['train_loss'].append(train_loss)
-        training_history['train_accuracy'].append(train_acc)
-        training_history['train_perplexity'].append(train_perp)
-        training_history['val_loss'].append(val_loss)
-        training_history['val_accuracy'].append(val_acc)
-        training_history['val_perplexity'].append(val_perp)
-        
-        # Calculate epoch duration
-        epoch_duration = time.time() - epoch_start_time
-        total_duration = time.time() - global_start_time
-        
-        # Display comprehensive epoch summary
-        print(f"\n🏆 EPOCH {epoch + 1} RESULTS:")
-        print(f"{'─'*50}")
-        print(f"⏱️  Duration: {epoch_duration:.1f}s | Total: {total_duration:.1f}s")
-        print(f"🔥 Training   → Loss: {train_loss:.4f} | Acc: {train_acc:.3f} | Perp: {train_perp:.2f}")
-        print(f"✅ Validation → Loss: {val_loss:.4f} | Acc: {val_acc:.3f} | Perp: {val_perp:.2f}")
-        
-        # Show improvement indicators
-        if epoch > 0:
-            prev_train_loss = training_history['train_loss'][-2]
-            prev_val_loss = training_history['val_loss'][-2]
-            train_improvement = prev_train_loss - train_loss
-            val_improvement = prev_val_loss - val_loss
-            
-            train_indicator = "📈" if train_improvement > 0 else "📉"
-            val_indicator = "📈" if val_improvement > 0 else "📉"
-            
-            print(f"📊 Changes    → Train: {train_indicator} {train_improvement:+.4f} | Val: {val_indicator} {val_improvement:+.4f}")
-        
-        print(f"{'─'*50}")
-        
-        # Save checkpoint
-        try:
-            checkpoint_path = os.path.join(checkpoint_dir, f"minigpt_epoch_{epoch+1:02d}.weights.h5")
-            model.save_weights(checkpoint_path)
-            print(f"💾 Checkpoint saved: {checkpoint_path}")
+                # Log progress every 100 batches
+                if batch_count % 100 == 0:
+                    logger.info(f"Epoch {epoch + 1}, Batch {batch_count}, Loss: {float(loss):.4f}")
+                    
         except Exception as e:
-            logger.error(f"❌ Error saving checkpoint: {e}")
-    
-    # Training completion summary
-    total_time = time.time() - global_start_time
-    print(f"\n{'🎉'*20}")
-    print(f"✨ TRAINING COMPLETED! ✨")
-    print(f"{'🎉'*20}")
-    print(f"⏰ Total training time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
-    print(f"🏁 Final metrics:")
-    print(f"   • Training Loss: {training_history['train_loss'][-1]:.4f}")
-    print(f"   • Training Accuracy: {training_history['train_accuracy'][-1]:.3f}")
-    print(f"   • Training Perplexity: {training_history['train_perplexity'][-1]:.2f}")
-    print(f"   • Validation Loss: {training_history['val_loss'][-1]:.4f}")
-    print(f"   • Validation Accuracy: {training_history['val_accuracy'][-1]:.3f}")
-    print(f"   • Validation Perplexity: {training_history['val_perplexity'][-1]:.2f}")
+            logger.error(f"Error during training: {e}")
+            continue
+        
+        # Validation
+        try:
+            for val_batch in val_dataset:
+                if val_batch is None:
+                    continue
+                    
+                input_ids = val_batch['input_ids']
+                if input_ids is None or tf.size(input_ids) == 0:
+                    continue
+                
+                # Ensure input has enough tokens
+                if tf.shape(input_ids)[1] < 2:
+                    continue
+                
+                val_step(val_batch)
+        except Exception as e:
+            logger.error(f"Error during validation: {e}")
+            continue
+        
+        # Log metrics
+        try:
+            with train_summary_writer.as_default():
+                tf.summary.scalar('loss', train_loss.result(), step=epoch)
+                tf.summary.scalar('perplexity', train_perplexity.result(), step=epoch)
+                tf.summary.scalar('accuracy', train_accuracy.result(), step=epoch)
+            
+            with val_summary_writer.as_default():
+                tf.summary.scalar('loss', val_loss.result(), step=epoch)
+                tf.summary.scalar('perplexity', val_perplexity.result(), step=epoch)
+                tf.summary.scalar('accuracy', val_accuracy.result(), step=epoch)
+        except Exception as e:
+            logger.error(f"Error logging metrics: {e}")
+        
+        # Print metrics
+        try:
+            logger.info(
+                f"Epoch {epoch + 1} - "
+                f"Train Loss: {float(train_loss.result()):.4f}, "
+                f"Train Perplexity: {float(train_perplexity.result()):.4f}, "
+                f"Train Accuracy: {float(train_accuracy.result()):.4f}, "
+                f"Val Loss: {float(val_loss.result()):.4f}, "
+                f"Val Perplexity: {float(val_perplexity.result()):.4f}, "
+                f"Val Accuracy: {float(val_accuracy.result()):.4f}"
+            )
+        except Exception as e:
+            logger.error(f"Error printing metrics: {e}")
+        
+        # Save checkpoint every epoch
+        try:
+            checkpoint.save(file_prefix=checkpoint_prefix)
+            logger.info(f"Checkpoint saved for epoch {epoch + 1}")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
     
     # Save final model
     try:
-        final_path = os.path.join(checkpoint_dir, "minigpt_final.weights.h5")
-        model.save_weights(final_path)
-        print(f"💾 Final model saved: {final_path}")
+        final_weights_path = './checkpoints/minigpt_final.weights.h5'
+        model.save_weights(final_weights_path)
+        logger.info(f"Training completed. Model saved to {final_weights_path}")
     except Exception as e:
-        logger.error(f"❌ Error saving final model: {e}")
-    
-    # Save training history
-    try:
-        history_path = os.path.join(checkpoint_dir, "training_history.json")
-        with open(history_path, 'w') as f:
-            json.dump(training_history, f, indent=2)
-        print(f"📊 Training history saved: {history_path}")
-    except Exception as e:
-        logger.error(f"❌ Error saving training history: {e}")
+        logger.error(f"Error saving final model: {e}")
     
     return model
 
-def simple_generate_text(model, prompt_tokens, max_length=50, temperature=0.8):
-    """Simple text generation function."""
-    if not hasattr(model, 'tokenizer') or model.tokenizer is None:
-        return "Text generation requires a tokenizer."
-    
-    try:
-        # Convert prompt to tokens if it's a string
-        if isinstance(prompt_tokens, str):
-            prompt_tokens = model.tokenizer.encode(prompt_tokens)
-        
-        # Ensure we have a reasonable prompt length
-        if len(prompt_tokens) > 100:
-            prompt_tokens = prompt_tokens[-100:]
-        
-        input_ids = tf.constant([prompt_tokens], dtype=tf.int32)
-        
-        for _ in range(max_length):
-            # Get model prediction
-            logits = model(input_ids, training=False)
-            next_token_logits = logits[0, -1, :] / temperature
-            
-            # Sample next token
-            next_token = tf.random.categorical([next_token_logits], 1)[0, 0]
-            
-            # Add to sequence
-            input_ids = tf.concat([input_ids, [[next_token]]], axis=1)
-            
-            # Stop at end token or max length
-            if next_token == model.tokenizer.eos_token_id:
-                break
-        
-        # Decode the generated sequence
-        generated_tokens = input_ids[0].numpy().tolist()
-        generated_text = model.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
-        return generated_text
-    except Exception as e:
-        logger.error(f"Error generating text: {e}")
-        return f"Error: {e}"
-
 def chat_loop(model):
     """Interactive chat loop with the model."""
-    print("\n🤖 Starting chat interface!")
-    print("💬 Type your message and press Enter to chat.")
-    print("🚪 Type 'quit', 'exit', or 'bye' to exit.")
-    print("=" * 50)
+    logger.info("Starting chat loop. Type 'quit' to exit.")
     
     while True:
-        try:
-            user_input = input("\n🧑 You: ").strip()
-            
-            if user_input.lower() in ['quit', 'exit', 'bye']:
-                print("👋 Goodbye! Thanks for chatting!")
-                break
-            
-            if not user_input:
-                continue
-            
-            print("🤔 AI is thinking...")
-            # Generate response
-            response = simple_generate_text(model, user_input, max_length=30)
-            print(f"🤖 AI: {response}")
-            
-        except KeyboardInterrupt:
-            print("\n👋 Goodbye! Thanks for chatting!")
+        # Get user input
+        user_input = input("\nYou: ").strip()
+        
+        # Check for quit command
+        if user_input.lower() == 'quit':
+            logger.info("Exiting chat loop.")
             break
+        
+        try:
+            # Generate response
+            if hasattr(model, 'chat'):
+                response = model.chat(user_input)
+            else:
+                response = "Chat functionality not implemented in model."
+            print(f"\nAI: {response}")
         except Exception as e:
-            logger.error(f"Error in chat loop: {e}")
-            print("🤖 AI: Sorry, I encountered an error. Please try again.")
+            logger.error(f"Error generating response: {e}")
+            print("\nAI: I apologize, but I encountered an error. Please try again.")
 
 if __name__ == "__main__":
-    # Set memory growth for GPU if available
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        try:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"🎮 GPU setup complete: {len(gpus)} GPU(s) available")
-        except RuntimeError as e:
-            logger.error(f"GPU setup error: {e}")
-    else:
-        print("💻 No GPU detected, using CPU")
-
-    # Enable mixed precision
-    policy = tf.keras.mixed_precision.Policy('mixed_float16')
-    tf.keras.mixed_precision.set_global_policy(policy)
-    print("⚡ Mixed precision enabled")
-
-    # Create model configuration with smaller parameters for testing
+    # Create model configuration
     config = ModelConfig(
         vocab_size=50257,
-        max_seq_len=512,     # Reduced from 1024
-        embed_dim=384,       # Reduced from 768
-        num_heads=6,         # Reduced from 12
-        num_layers=6,        # Reduced from 12
-        ffn_dim=1536,        # Reduced from 3072
+        max_seq_len=512,
+        embed_dim=384,
+        num_heads=6,
+        num_layers=6,
+        ffn_dim=1536,
         dropout=0.1,
         use_custom_attention=True,
         use_rotary_embeddings=True,
-        learning_rate=5e-4,  # Slightly higher learning rate
-        batch_size=4,        # Reduced batch size
-        seq_len=512          # Reduced sequence length
+        learning_rate=5e-4,
+        batch_size=1,  # Changed from 8 to 1
+        seq_len=512
     )
-
-    print("\n🏗️  INITIALIZING MODEL")
-    print("=" * 50)
+    
+    # Create model
     logger.info("Creating model...")
     model = EnhancedMiniGPT(config)
-
-    # Build model
-    print("🔧 Building model architecture...")
-    dummy_input = tf.random.uniform((2, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
+    
+    # Build model by calling it with dummy input
+    dummy_input = tf.random.uniform((1, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
     _ = model(dummy_input)
+    logger.info(f"Model created successfully with {model.count_params():,} parameters")
     
-    print(f"✅ Model created successfully!")
-    print(f"📊 Model parameters: {model.count_params():,}")
-    print(f"🧠 Architecture: {config.num_layers} layers, {config.num_heads} heads, {config.embed_dim} dimensions")
-
     # Train model
-    print("\n🎯 INITIATING TRAINING SEQUENCE")
-    print("=" * 50)
-    try:
-        model = train_model(model, config)
-        print("🎊 Training completed successfully!")
-    except Exception as e:
-        logger.error(f"❌ Training failed: {e}")
-        print(f"💥 Training encountered an error: {e}")
-        print("🔧 Check the logs above for more details.")
-
-    # Start chat loop
-    print("\n🚀 LAUNCHING CHAT INTERFACE")
-    print("=" * 50)
-    try:
-        chat_loop(model)
-    except Exception as e:
-        logger.error(f"❌ Chat interface error: {e}")
-        print(f"💥 Chat interface encountered an error: {e}")
+    logger.info("Starting training...")
+    model = train_model(model, config)
     
-    print("\n🎯 PROGRAM COMPLETED")
-    print("=" * 30)
-    print("Thank you for using MiniGPT! 🤖✨")
+    # Start chat loop
+    chat_loop(model)
