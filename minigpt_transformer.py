@@ -591,36 +591,59 @@ class MoEMiniGPT(Model):
         
     def compute_loss(self, input_ids, labels=None):
         """Compute the loss for training including MoE auxiliary losses."""
+        # Handle the case where labels are None - create labels from input_ids
         if labels is None:
-            input_for_model = input_ids[:, :-1]
-            labels = input_ids[:, 1:]
-        else:
-            input_for_model = input_ids
+            # For language modeling, shift input_ids to create labels
+            # input: [batch, seq_len] -> model_input: [batch, seq_len-1], labels: [batch, seq_len-1]
+            if len(input_ids.shape) == 1:
+                input_ids = tf.expand_dims(input_ids, 0)
             
+            input_for_model = input_ids[:, :-1]  # All tokens except last
+            labels = input_ids[:, 1:]            # All tokens except first (shifted)
+        else:
+            # Labels provided explicitly
+            input_for_model = input_ids
+        
+        # Ensure labels is not None at this point
+        if labels is None:
+            raise ValueError("Labels cannot be None after processing input_ids")
+        
         # Get model predictions
         logits = self(input_for_model, training=True)
         
+        # Ensure shapes are compatible
+        batch_size = tf.shape(labels)[0]
+        seq_len = tf.shape(labels)[1]
+        
         # Reshape for loss computation
-        labels_flat = tf.reshape(labels, [-1])
-        logits_flat = tf.reshape(logits, [-1, self.config.vocab_size])
+        labels_flat = tf.reshape(labels, [-1])  # [batch_size * seq_len]
+        logits_flat = tf.reshape(logits, [-1, self.config.vocab_size])  # [batch_size * seq_len, vocab_size]
         
         # Create mask to ignore padding tokens (if using padding)
-        mask = tf.not_equal(labels_flat, -100)  # -100 is commonly used for ignored tokens
+        # You can modify this condition based on your padding token ID
+        # Common values: -100, 0, or your tokenizer's pad_token_id
+        pad_token_id = -100  # Change this to your actual padding token ID if different
+        mask = tf.not_equal(labels_flat, pad_token_id)
         
-        # Main language modeling loss
+        # Compute sparse categorical crossentropy loss
         losses = tf.keras.losses.sparse_categorical_crossentropy(
-            labels_flat, logits_flat, from_logits=True
+            labels_flat, 
+            logits_flat, 
+            from_logits=True
         )
         
-        # Apply mask if needed
+        # Apply mask to ignore padded positions
         if tf.reduce_any(mask):
-            losses = tf.where(mask, losses, 0.0)
-            main_loss = tf.reduce_sum(losses) / tf.reduce_sum(tf.cast(mask, tf.float32))
+            # Only compute loss on non-padded tokens
+            masked_losses = tf.where(mask, losses, 0.0)
+            main_loss = tf.reduce_sum(masked_losses) / tf.reduce_sum(tf.cast(mask, tf.float32))
         else:
+            # If no mask is needed, compute mean loss
             main_loss = tf.reduce_mean(losses)
         
-        # Add auxiliary losses from MoE layers (already added via self.add_loss)
-        total_loss = main_loss + tf.reduce_sum(self.losses)
+        # Add auxiliary losses from MoE layers (these are added via self.add_loss in MoE layers)
+        auxiliary_losses = tf.reduce_sum(self.losses) if self.losses else 0.0
+        total_loss = main_loss + auxiliary_losses
         
         return total_loss
 

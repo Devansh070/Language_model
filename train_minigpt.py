@@ -125,16 +125,16 @@ class DatasetLoader:
     def _create_synthetic_conversations(self, num_samples=1000):
         """Create synthetic conversation data as fallback"""
         conversation_templates = [
-            "Human: How are you today?\nAssistant: I'm doing well, thank you! How about you?\nHuman: I'm great, thanks for asking.",
-            "Human: What's the weather like?\nAssistant: I don't have access to current weather data, but I'd be happy to help you find weather information.\nHuman: That's okay, I'll check online.",
-            "Human: Can you help me with a programming question?\nAssistant: Of course! I'd be happy to help with programming. What's your question?\nHuman: I need to understand how loops work in Python.",
-            "Human: Tell me about machine learning.\nAssistant: Machine learning is a subset of AI that enables computers to learn from data without explicit programming.\nHuman: That sounds interesting. Can you give me an example?",
-            "Human: I'm feeling stressed about work.\nAssistant: I understand work stress can be challenging. Would you like to talk about what's causing the stress?\nHuman: Yes, I have too many deadlines coming up.",
-            "Human: What's your favorite programming language?\nAssistant: I don't have personal preferences, but I can help you choose a language based on your needs.\nHuman: I want to learn web development.",
-            "Human: Explain quantum computing.\nAssistant: Quantum computing uses quantum mechanical phenomena to process information in ways classical computers cannot.\nHuman: That sounds complex but fascinating.",
-            "Human: How do neural networks work?\nAssistant: Neural networks are inspired by the human brain and consist of interconnected nodes that process information.\nHuman: Can you give me a simple example?",
-            "Human: What should I learn first in data science?\nAssistant: I'd recommend starting with Python programming and basic statistics.\nHuman: Where can I find good resources for learning?",
-            "Human: I'm having trouble debugging my code.\nAssistant: I'd be happy to help! Can you tell me what error you're encountering?\nHuman: I keep getting a syntax error but I can't find it."
+            "Human: How are you today?\nI'm doing well, thank you! How about you?\nHuman: I'm great, thanks for asking.",
+            "Human: What's the weather like?\nI don't have access to current weather data, but I'd be happy to help you find weather information.\nHuman: That's okay, I'll check online.",
+            "Human: Can you help me with a programming question?\nOf course! I'd be happy to help with programming. What's your question?\nHuman: I need to understand how loops work in Python.",
+            "Human: Tell me about machine learning.\nMachine learning is a subset of AI that enables computers to learn from data without explicit programming.\nHuman: That sounds interesting. Can you give me an example?",
+            "Human: I'm feeling stressed about work.\nI understand work stress can be challenging. Would you like to talk about what's causing the stress?\nHuman: Yes, I have too many deadlines coming up.",
+            "Human: What's your favorite programming language?\nI don't have personal preferences, but I can help you choose a language based on your needs.\nHuman: I want to learn web development.",
+            "Human: Explain quantum computing.\nQuantum computing uses quantum mechanical phenomena to process information in ways classical computers cannot.\nHuman: That sounds complex but fascinating.",
+            "Human: How do neural networks work?\nNeural networks are inspired by the human brain and consist of interconnected nodes that process information.\nHuman: Can you give me a simple example?",
+            "Human: What should I learn first in data science?\nI'd recommend starting with Python programming and basic statistics.\nHuman: Where can I find good resources for learning?",
+            "Human: I'm having trouble debugging my code.\nI'd be happy to help! Can you tell me what error you're encountering?\nHuman: I keep getting a syntax error but I can't find it."
         ]
         
         synthetic_conversations = []
@@ -144,7 +144,7 @@ class DatasetLoader:
             if i % 3 == 0:
                 template = template.replace("Human:", "User:")
             elif i % 3 == 1:
-                template = template.replace("Assistant:", "AI:")
+                template = template.replace("I'm", "I am").replace("I'd", "I would").replace("I'll", "I will")
             
             synthetic_conversations.append(template)
         
@@ -178,16 +178,16 @@ class DatasetLoader:
     def _create_general_text_samples(self, num_samples=500):
         """Create general text samples for training diversity"""
         general_texts = [
-            "The importance of artificial intelligence in modern technology cannot be overstated. It has applications in healthcare, finance, transportation, and many other sectors.",
-            "Natural language processing enables computers to understand and generate human language. This technology powers chatbots, translation services, and text analysis tools.",
-            "Deep learning models use neural networks with multiple layers to learn complex patterns in data. These models have achieved remarkable success in image recognition, speech processing, and language understanding.",
-            "Python is a versatile programming language used for web development, data science, machine learning, and automation. Its simple syntax makes it popular among beginners and experts alike.",
-            "Cloud computing has revolutionized how businesses store and process data. It offers scalability, cost-effectiveness, and accessibility from anywhere in the world.",
-            "Cybersecurity is crucial in our digital age. Organizations must protect their data and systems from various threats including malware, phishing, and unauthorized access.",
-            "The Internet of Things (IoT) connects everyday devices to the internet, enabling smart homes, wearable technology, and industrial automation.",
-            "Blockchain technology provides a secure and transparent way to record transactions. It has applications beyond cryptocurrency, including supply chain management and digital identity verification.",
-            "Data visualization helps people understand complex information through charts, graphs, and interactive dashboards. It's essential for business intelligence and scientific research.",
-            "Software engineering best practices include version control, code review, testing, and documentation. These practices ensure code quality and maintainability."
+            "The importance of artificial intelligence in modern technology cannot be overstated. I have applications in healthcare, finance, transportation, and many other sectors.",
+            "Natural language processing enables computers to understand and generate human language. I power chatbots, translation services, and text analysis tools.",
+            "Deep learning models use neural networks with multiple layers to learn complex patterns in data. I have achieved remarkable success in image recognition, speech processing, and language understanding.",
+            "Python is a versatile programming language used for web development, data science, machine learning, and automation. My simple syntax makes me popular among beginners and experts alike.",
+            "Cloud computing has revolutionized how businesses store and process data. I offer scalability, cost-effectiveness, and accessibility from anywhere in the world.",
+            "Cybersecurity is crucial in our digital age. Organizations must protect their data and systems from various threats including malware, phishing, and unauthorized access. I help ensure digital security.",
+            "The Internet of Things (IoT) connects everyday devices to the internet, enabling smart homes, wearable technology, and industrial automation. I facilitate these connections.",
+            "Blockchain technology provides a secure and transparent way to record transactions. I have applications beyond cryptocurrency, including supply chain management and digital identity verification.",
+            "Data visualization helps people understand complex information through charts, graphs, and interactive dashboards. I am essential for business intelligence and scientific research.",
+            "Software engineering best practices include version control, code review, testing, and documentation. I ensure code quality and maintainability through these practices."
         ] * (num_samples // 10 + 1)
         
         return general_texts[:num_samples]
@@ -509,11 +509,11 @@ def test_generation(model, tokenizer, config):
             "Human: Hello, how are you today?",
             "User: Can you help me with a question?",
             "Human: What's the weather like?",
-            "Assistant: I'd be happy to help you with",
+            "I'd be happy to help you with",
             "The conversation started when",
             "In machine learning,",
             "Programming is",
-            "Human: I'm feeling stressed about work.\nAssistant:"
+            "Human: I'm feeling stressed about work.\n"
         ]
         
         logger.info("Testing enhanced text generation:")
@@ -610,20 +610,20 @@ def create_simple_text_dataset(vocab_size=50257, seq_len=1024, batch_size=1, num
     # Create diverse training texts (enhanced version)
     training_texts = [
         "Hello world! How are you today? I hope you are doing well and having a great time learning about natural language processing.",
-        "Human: How can I help you today?\nAssistant: I'm here to help with any questions you might have. What would you like to know?",
-        "The conversation between humans and AI systems is becoming increasingly natural and helpful.",
-        "Machine learning enables computers to learn patterns from data and make intelligent decisions.",
-        "Natural language processing allows computers to understand and generate human language effectively.",
-        "Deep learning models use neural networks to process complex patterns in text and speech.",
-        "Training language models requires large datasets and significant computational resources.",
-        "Transformers have revolutionized the field of natural language understanding and generation.",
-        "Human: What is artificial intelligence?\nAssistant: Artificial intelligence is the simulation of human intelligence in machines.",
-        "The development of conversational AI has made significant progress in recent years.",
-        "User: Can you explain machine learning?\nAI: Machine learning is a subset of AI that learns from data.",
-        "Programming languages like Python are essential for developing AI applications.",
-        "Data science combines statistics, programming, and domain knowledge to extract insights.",
-        "Human: I'm interested in learning about neural networks.\nAssistant: Neural networks are inspired by the human brain.",
-        "The future of AI includes applications in healthcare, education, and many other fields."
+        "Human: How can I help you today?\nI'm here to help with any questions you might have. What would you like to know?",
+        "The conversation between humans and AI systems is becoming increasingly natural and helpful. I facilitate these interactions.",
+        "Machine learning enables computers to learn patterns from data and make intelligent decisions. I am an example of this technology.",
+        "Natural language processing allows computers to understand and generate human language effectively. I use these techniques to communicate.",
+        "Deep learning models use neural networks to process complex patterns in text and speech. I am built using these advanced methods.",
+        "Training language models requires large datasets and significant computational resources. I was trained using these approaches.",
+        "Transformers have revolutionized the field of natural language understanding and generation. I am based on transformer architecture.",
+        "Human: What is artificial intelligence?\nArtificial intelligence is the simulation of human intelligence in machines. I am an example of AI.",
+        "The development of conversational AI has made significant progress in recent years. I represent this advancement.",
+        "User: Can you explain machine learning?\nMachine learning is a subset of AI that learns from data. I use machine learning techniques.",
+        "Programming languages like Python are essential for developing AI applications. I was developed using these tools.",
+        "Data science combines statistics, programming, and domain knowledge to extract insights. I apply these principles.",
+        "Human: I'm interested in learning about neural networks.\nNeural networks are inspired by the human brain. I am built using neural network architectures.",
+        "The future of AI includes applications in healthcare, education, and many other fields. I can contribute to these areas."
     ] * (num_samples // 15 + 1)
     
     def data_generator():
@@ -714,7 +714,7 @@ if __name__ == "__main__":
         dummy_input = tf.random.uniform((1, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
         _ = model(dummy_input)
         
-        # Log model parameters
+        # Log model summary
         total_params = model.count_params()
         logger.info(f"Model initialized with {total_params:,} parameters")
         
@@ -722,11 +722,39 @@ if __name__ == "__main__":
         logger.info("Starting model training...")
         trained_model, history = enhanced_train_model(model, config)
         
-        # Test generation
-        logger.info("Testing text generation...")
+        # Save final model and configuration
+        save_dir = "trained_models"
+        os.makedirs(save_dir, exist_ok=True)
+        
+        try:
+            # Save model weights
+            model_path = os.path.join(save_dir, "moe_minigpt_final.h5")
+            trained_model.save_weights(model_path)
+            logger.info(f"Model saved to {model_path}")
+            
+            # Save configuration
+            config_path = os.path.join(save_dir, "moe_config.json")
+            with open(config_path, 'w') as f:
+                # Convert config to dictionary, handling special types
+                config_dict = {k: str(v) if isinstance(v, (list, type(None))) else v 
+                             for k, v in vars(config).items()}
+                json.dump(config_dict, f, indent=2)
+            logger.info(f"Configuration saved to {config_path}")
+            
+            # Save training history
+            history_path = os.path.join(save_dir, "training_history.json")
+            with open(history_path, 'w') as f:
+                json.dump(history, f, indent=2)
+            logger.info(f"Training history saved to {history_path}")
+            
+        except Exception as e:
+            logger.error(f"Error saving model artifacts: {e}")
+        
+        # Final generation test
+        logger.info("\nRunning final generation tests...")
         test_prompts = [
-            "Human: Hello, how are you today?",
-            "Human: Can you explain what machine learning is?",
+            "Human: What can you tell me about machine learning?",
+            "Human: How does a transformer model work?",
             "Human: Write a short poem about AI."
         ]
         
@@ -742,26 +770,11 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.error(f"Generation error for prompt '{prompt}': {e}")
         
-        # Save the trained model
-        save_dir = "trained_model"
-        if not os.path.exists(save_dir):
-            os.makedirs(save_dir)
-        
-        try:
-            model_path = os.path.join(save_dir, "moe_minigpt_model.h5")
-            trained_model.save_weights(model_path)
-            logger.info(f"Model saved to {model_path}")
-            
-            # Save training history
-            history_path = os.path.join(save_dir, "training_history.json")
-            with open(history_path, 'w') as f:
-                json.dump(history, f, indent=2)
-            logger.info(f"Training history saved to {history_path}")
-            
-        except Exception as e:
-            logger.error(f"Error saving model: {e}")
-        
-        logger.info("Training completed successfully!")
+        # Print final statistics
+        logger.info("\nTraining completed successfully!")
+        logger.info(f"Final training loss: {history['train_loss'][-1]:.4f}")
+        logger.info(f"Final validation loss: {history['val_loss'][-1]:.4f}")
+        logger.info(f"Best validation loss: {min(history['val_loss']):.4f}")
         
     except Exception as e:
         logger.error(f"Error in main execution: {e}")
