@@ -1,288 +1,460 @@
 import tensorflow as tf
-import numpy as np
-import os
-import logging
 from datetime import datetime
 import json
 from pathlib import Path
 import re
+import logging
+import numpy as np
+import os
+from datasets import load_dataset
+import random
+
+# Import from the model file
+try:
+    from transformers import AutoTokenizer  # Fixed: GPT2tokenizer -> AutoTokenizer
+    HAS_TRANSFORMERS = True
+except ImportError:
+    print("Warning: transformers library not found. Please install with: pip install transformers")
+    HAS_TRANSFORMERS = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-class SimpleTokenizer:
-    """Simple byte-pair encoding style tokenizer"""
-    def __init__(self, vocab_size=50257):
-        self.vocab_size = vocab_size
-        # Create a simple vocabulary
-        self.char_to_id = {}
-        self.id_to_char = {}
-        
-        # Add special tokens
-        special_tokens = ['<pad>', '<unk>', '<bos>', '<eos>']
-        for i, token in enumerate(special_tokens):
-            self.char_to_id[token] = i
-            self.id_to_char[i] = token
-        
-        # Add ASCII characters
-        for i in range(32, 127):  # Printable ASCII
-            char = chr(i)
-            token_id = len(self.char_to_id)
-            if token_id < vocab_size:
-                self.char_to_id[char] = token_id
-                self.id_to_char[token_id] = char
-        
-        # Fill remaining vocabulary with dummy tokens
-        for i in range(len(self.char_to_id), vocab_size):
-            self.id_to_char[i] = f'<token_{i}>'
+class DatasetLoader:
+    """Enhanced dataset loader with GPT-2 tokenizer"""
     
-    def encode(self, text):
-        """Encode text to token IDs"""
-        if not text:
+    def __init__(self, seq_len=1024):
+        # Initialize GPT-2 tokenizer
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            logger.info("Initialized GPT-2 tokenizer")
+        except Exception as e:
+            logger.error(f"Failed to initialize GPT-2 tokenizer: {e}")
+            raise
+            
+        self.seq_len = seq_len
+        self.datasets = {}
+        
+    def load_daily_dialogue(self, split='train', max_samples=None):
+        """Load and process the daily_dialogue dataset"""
+        try:
+            logger.info(f"Loading daily_dialogue dataset ({split} split)...")
+            dataset = load_dataset("daily_dialog", split=split)
+            
+            if max_samples:
+                dataset = dataset.select(range(min(len(dataset), max_samples)))
+            
+            processed_texts = []
+            for example in dataset:
+                # Join dialogue turns with speaker tokens
+                dialogue = example['dialog']
+                processed_dialogue = []
+                
+                for i, turn in enumerate(dialogue):
+                    speaker = "Human" if i % 2 == 0 else "Assistant"
+                    processed_dialogue.append(f"{speaker}: {turn}")
+                
+                # Join all turns in the dialogue
+                full_dialogue = "\n".join(processed_dialogue)
+                processed_texts.append(full_dialogue)
+            
+            logger.info(f"Loaded {len(processed_texts)} dialogues from daily_dialogue")
+            return processed_texts
+            
+        except Exception as e:
+            logger.error(f"Error loading daily_dialogue: {e}")
             return []
-        
-        tokens = []
-        tokens.append(self.char_to_id.get('<bos>', 2))  # Start token
-        
-        for char in text:
-            token_id = self.char_to_id.get(char, self.char_to_id.get('<unk>', 1))
-            tokens.append(token_id)
-        
-        tokens.append(self.char_to_id.get('<eos>', 3))  # End token
-        return tokens
     
-    def decode(self, token_ids):
-        """Decode token IDs to text"""
-        text = ""
-        for token_id in token_ids:
-            if token_id == self.char_to_id.get('<bos>', 2):
-                continue
-            elif token_id == self.char_to_id.get('<eos>', 3):
-                break
-            elif token_id == self.char_to_id.get('<pad>', 0):
-                continue
-            else:
-                char = self.id_to_char.get(token_id, '<unk>')
-                if not char.startswith('<token_'):
-                    text += char
-        return text
-
-def create_simple_text_dataset(vocab_size=50257, seq_len=512, batch_size=1, num_samples=1000):
-    """Create a simple text dataset with meaningful patterns"""
-    tokenizer = SimpleTokenizer(vocab_size)
+    def load_conv2ai(self, split='train', max_samples=None):
+        """Load and process alternative conversation datasets"""
+        try:
+            logger.info(f"Attempting to load conversation dataset ({split} split)...")
+            
+            # Try multiple potential dataset names
+            dataset_names = ["conv_ai_2", "blended_skill_talk", "empathetic_dialogues"]
+            dataset = None
+            
+            for name in dataset_names:
+                try:
+                    dataset = load_dataset(name, split=split)
+                    logger.info(f"Successfully loaded {name} dataset")
+                    break
+                except Exception as e:
+                    logger.warning(f"Could not load {name}: {e}")
+                    continue
+            
+            if dataset is None:
+                raise Exception("No conversation datasets available")
+            
+            if max_samples:
+                dataset = dataset.select(range(min(len(dataset), max_samples)))
+            
+            processed_texts = []
+            for example in dataset:
+                # Handle different dataset structures
+                if 'text' in example:
+                    processed_texts.append(example['text'])
+                elif 'dialogue' in example:
+                    if isinstance(example['dialogue'], list):
+                        dialogue_text = "\n".join([f"Turn {i+1}: {turn}" for i, turn in enumerate(example['dialogue'])])
+                    else:
+                        dialogue_text = str(example['dialogue'])
+                    processed_texts.append(dialogue_text)
+                elif 'utterances' in example:
+                    utterances = example['utterances']
+                    if isinstance(utterances, list):
+                        dialogue_text = "\n".join([f"Speaker: {utt}" for utt in utterances])
+                    else:
+                        dialogue_text = str(utterances)
+                    processed_texts.append(dialogue_text)
+                else:
+                    # Fallback - convert entire example to string
+                    processed_texts.append(str(example))
+            
+            logger.info(f"Loaded {len(processed_texts)} conversations from dataset")
+            return processed_texts
+            
+        except Exception as e:
+            logger.error(f"Error loading conversation datasets: {e}")
+            logger.info("Using fallback synthetic conversation data")
+            return self._create_synthetic_conversations(max_samples or 1000)
     
-    # Create more diverse training texts for longer sequences
-    training_texts = [
-        "Hello world! How are you today? I hope you are doing well and having a great time learning about natural language processing.",
-        "The quick brown fox jumps over the lazy dog. This sentence contains all the letters of the alphabet and is commonly used for testing.",
-        "Machine learning is fascinating and powerful. It enables computers to learn patterns from data without being explicitly programmed for every task.",
-        "Natural language processing enables computers to understand text. It combines computational linguistics with machine learning to process human language.",
-        "Deep learning models can generate human-like text. These models use neural networks with multiple layers to learn complex patterns in language.",
-        "Training neural networks requires lots of data and computation. The process involves adjusting millions of parameters to minimize prediction errors.",
-        "Transformers revolutionized natural language understanding. They use attention mechanisms to process sequences more effectively than previous architectures.",
-        "Attention is all you need for sequence modeling. This phrase comes from the famous paper that introduced the Transformer architecture.",
-        "GPT models are autoregressive language models. They generate text by predicting the next token based on all previous tokens in the sequence.",
-        "Fine-tuning pretrained models is very effective. It allows us to adapt general language models to specific tasks with relatively little additional data.",
-        "Large language models have emerged as powerful tools for various natural language tasks. They can perform translation, summarization, question answering, and text generation with remarkable accuracy.",
-        "The field of artificial intelligence has grown rapidly in recent years. Advances in computing power and algorithmic improvements have enabled new breakthroughs in machine learning.",
-        "Programming is both an art and a science. It requires logical thinking, creativity, and attention to detail to create efficient and maintainable software systems.",
-        "Data science combines statistics, programming, and domain expertise. It involves collecting, cleaning, analyzing, and interpreting data to extract meaningful insights.",
-        "Software engineering best practices include writing clean code, testing thoroughly, and documenting your work. These practices help create reliable and maintainable systems."
-    ] * (num_samples // 15 + 1)  # Repeat to get enough samples
-    
-    def data_generator():
+    def _create_synthetic_conversations(self, num_samples=1000):
+        """Create synthetic conversation data as fallback"""
+        conversation_templates = [
+            "Human: How are you today?\nAssistant: I'm doing well, thank you! How about you?\nHuman: I'm great, thanks for asking.",
+            "Human: What's the weather like?\nAssistant: I don't have access to current weather data, but I'd be happy to help you find weather information.\nHuman: That's okay, I'll check online.",
+            "Human: Can you help me with a programming question?\nAssistant: Of course! I'd be happy to help with programming. What's your question?\nHuman: I need to understand how loops work in Python.",
+            "Human: Tell me about machine learning.\nAssistant: Machine learning is a subset of AI that enables computers to learn from data without explicit programming.\nHuman: That sounds interesting. Can you give me an example?",
+            "Human: I'm feeling stressed about work.\nAssistant: I understand work stress can be challenging. Would you like to talk about what's causing the stress?\nHuman: Yes, I have too many deadlines coming up.",
+            "Human: What's your favorite programming language?\nAssistant: I don't have personal preferences, but I can help you choose a language based on your needs.\nHuman: I want to learn web development.",
+            "Human: Explain quantum computing.\nAssistant: Quantum computing uses quantum mechanical phenomena to process information in ways classical computers cannot.\nHuman: That sounds complex but fascinating.",
+            "Human: How do neural networks work?\nAssistant: Neural networks are inspired by the human brain and consist of interconnected nodes that process information.\nHuman: Can you give me a simple example?",
+            "Human: What should I learn first in data science?\nAssistant: I'd recommend starting with Python programming and basic statistics.\nHuman: Where can I find good resources for learning?",
+            "Human: I'm having trouble debugging my code.\nAssistant: I'd be happy to help! Can you tell me what error you're encountering?\nHuman: I keep getting a syntax error but I can't find it."
+        ]
+        
+        synthetic_conversations = []
         for i in range(num_samples):
-            text = training_texts[i % len(training_texts)]
+            template = random.choice(conversation_templates)
             # Add some variation
-            if i % 4 == 0:
-                text = text.upper()
-            elif i % 4 == 1:
-                text = text.lower()
-            elif i % 4 == 2:
-                text = text.title()
-            # else: keep original case
+            if i % 3 == 0:
+                template = template.replace("Human:", "User:")
+            elif i % 3 == 1:
+                template = template.replace("Assistant:", "AI:")
             
-            # Tokenize
-            tokens = tokenizer.encode(text)
-            
-            # Pad or truncate to seq_len
-            if len(tokens) < seq_len:
-                tokens.extend([tokenizer.char_to_id.get('<pad>', 0)] * (seq_len - len(tokens)))
-            else:
-                tokens = tokens[:seq_len]
-            
-            yield {'input_ids': np.array(tokens, dtype=np.int32)}
+            synthetic_conversations.append(template)
+        
+        return synthetic_conversations
     
-    # Create dataset
+    def create_combined_dataset(self, daily_dialogue_samples=2000, conv2ai_samples=1000, 
+                              include_synthetic=True, synthetic_samples=1000):
+        """Create a combined dataset from multiple sources"""
+        all_texts = []
+        
+        # Load daily_dialogue
+        daily_texts = self.load_daily_dialogue(max_samples=daily_dialogue_samples)
+        all_texts.extend(daily_texts)
+        
+        # Load alternative conversation datasets
+        conv2ai_texts = self.load_conv2ai(max_samples=conv2ai_samples)
+        all_texts.extend(conv2ai_texts)
+        
+        # Add synthetic data if requested
+        if include_synthetic:
+            synthetic_texts = self._create_synthetic_conversations(synthetic_samples)
+            all_texts.extend(synthetic_texts)
+        
+        # Add some general text data for diversity
+        general_texts = self._create_general_text_samples(500)
+        all_texts.extend(general_texts)
+        
+        logger.info(f"Created combined dataset with {len(all_texts)} samples")
+        return all_texts
+    
+    def _create_general_text_samples(self, num_samples=500):
+        """Create general text samples for training diversity"""
+        general_texts = [
+            "The importance of artificial intelligence in modern technology cannot be overstated. It has applications in healthcare, finance, transportation, and many other sectors.",
+            "Natural language processing enables computers to understand and generate human language. This technology powers chatbots, translation services, and text analysis tools.",
+            "Deep learning models use neural networks with multiple layers to learn complex patterns in data. These models have achieved remarkable success in image recognition, speech processing, and language understanding.",
+            "Python is a versatile programming language used for web development, data science, machine learning, and automation. Its simple syntax makes it popular among beginners and experts alike.",
+            "Cloud computing has revolutionized how businesses store and process data. It offers scalability, cost-effectiveness, and accessibility from anywhere in the world.",
+            "Cybersecurity is crucial in our digital age. Organizations must protect their data and systems from various threats including malware, phishing, and unauthorized access.",
+            "The Internet of Things (IoT) connects everyday devices to the internet, enabling smart homes, wearable technology, and industrial automation.",
+            "Blockchain technology provides a secure and transparent way to record transactions. It has applications beyond cryptocurrency, including supply chain management and digital identity verification.",
+            "Data visualization helps people understand complex information through charts, graphs, and interactive dashboards. It's essential for business intelligence and scientific research.",
+            "Software engineering best practices include version control, code review, testing, and documentation. These practices ensure code quality and maintainability."
+        ] * (num_samples // 10 + 1)
+        
+        return general_texts[:num_samples]
+
+def create_enhanced_dataset(seq_len=1024, batch_size=1, 
+                          daily_dialogue_samples=2000, conv2ai_samples=1000,
+                          include_synthetic=True, validation_split=0.1):
+    """Create enhanced dataset with GPT-2 tokenizer - FIXED"""
+    
+    # Initialize dataset loader (tokenizer is initialized inside)
+    loader = DatasetLoader(seq_len=seq_len)
+    tokenizer = loader.tokenizer  # Get tokenizer from loader
+    
+    # Create combined dataset
+    all_texts = loader.create_combined_dataset(
+        daily_dialogue_samples=daily_dialogue_samples,
+        conv2ai_samples=conv2ai_samples,
+        include_synthetic=include_synthetic
+    )
+    
+    # Shuffle the data
+    random.shuffle(all_texts)
+    
+    # Split into train and validation
+    split_idx = int(len(all_texts) * (1 - validation_split))
+    train_texts = all_texts[:split_idx]
+    val_texts = all_texts[split_idx:]
+    
+    logger.info(f"Train samples: {len(train_texts)}, Validation samples: {len(val_texts)}")
+    
+    # Create TensorFlow datasets
+    train_dataset = create_tf_dataset_from_texts(train_texts, tokenizer, seq_len, batch_size)
+    val_dataset = create_tf_dataset_from_texts(val_texts, tokenizer, seq_len, batch_size)
+    
+    return train_dataset, val_dataset, tokenizer
+
+def create_tf_dataset_from_texts(texts, tokenizer, seq_len, batch_size):
+    """Convert text list to TensorFlow dataset - FIXED"""
+    
+    def text_generator():
+        for text in texts:
+            # Tokenize with proper handling
+            try:
+                # Encode text with padding and truncation
+                encoded = tokenizer.encode(
+                    text,
+                    add_special_tokens=True,
+                    max_length=seq_len + 1,
+                    truncation=True,
+                    padding='max_length',
+                )
+                
+                # Ensure we have the right length
+                if len(encoded) < seq_len + 1:
+                    encoded = encoded + [tokenizer.pad_token_id] * (seq_len + 1 - len(encoded))
+                elif len(encoded) > seq_len + 1:
+                    encoded = encoded[:seq_len + 1]
+                
+                encoded = np.array(encoded, dtype=np.int32)
+                
+                # Create input/target pairs for causal language modeling
+                input_ids = encoded[:-1]
+                target_ids = encoded[1:]
+                
+                yield {
+                    'input_ids': input_ids,
+                    'target_ids': target_ids
+                }
+                
+            except Exception as e:
+                logger.warning(f"Error processing text: {e}")
+                # Skip problematic texts
+                continue
+    
+    # Create TensorFlow dataset
     dataset = tf.data.Dataset.from_generator(
-        data_generator,
+        text_generator,
         output_signature={
-            'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
+            'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32),
+            'target_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
         }
     )
     
-    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE), tokenizer
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 def create_improved_training_function(model, config):
-    """Create improved training function with better loss handling"""
+    """Creates an improved training function for the MoEMiniGPT model."""
     
-    # Create optimizer with your specified learning rate and gradient clipping
+    # Create optimizer with gradient clipping
     optimizer = tf.keras.optimizers.Adam(
-        learning_rate=config.learning_rate,  # Using your 5e-4
+        learning_rate=config.learning_rate,
         beta_1=0.9,
         beta_2=0.999,
         epsilon=1e-8,
-        clipnorm=1.0
+        clipnorm=1.0  # Add gradient clipping
     )
     
-    # Loss function
-    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(
-        from_logits=True, 
-        reduction='none'
-    )
-    
-    # Metrics
+    # Create metrics
     train_loss = tf.keras.metrics.Mean(name='train_loss')
     train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+    val_loss = tf.keras.metrics.Mean(name='val_loss')
+    val_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='val_accuracy')
     
     @tf.function
     def train_step(batch):
-        input_ids = batch['input_ids']
-        
-        # Create inputs and targets
-        inputs = input_ids[:, :-1]  # All except last token
-        targets = input_ids[:, 1:]  # All except first token
+        inputs = batch['input_ids']
+        targets = batch['target_ids']
         
         with tf.GradientTape() as tape:
-            # Forward pass
-            logits = model(inputs, training=True)
+            predictions = model(inputs, training=True)
+            loss = tf.keras.losses.sparse_categorical_crossentropy(
+                targets, predictions, from_logits=True
+            )
+            loss = tf.reduce_mean(loss)
             
-            # Ensure shapes match
-            batch_size = tf.shape(targets)[0]
-            seq_len = tf.shape(targets)[1]
-            vocab_size = tf.shape(logits)[-1]
-            
-            # Reshape for loss computation
-            targets_flat = tf.reshape(targets, [-1])
-            logits_flat = tf.reshape(logits, [-1, vocab_size])
-            
-            # Create mask to ignore padding tokens
-            mask = tf.cast(tf.not_equal(targets_flat, 0), tf.float32)  # 0 is pad token
-            
-            # Compute loss
-            loss_per_token = loss_fn(targets_flat, logits_flat)
-            masked_loss = loss_per_token * mask
-            
-            # Average over non-padded tokens
-            total_loss = tf.reduce_sum(masked_loss)
-            total_tokens = tf.reduce_sum(mask)
-            loss = total_loss / tf.maximum(total_tokens, 1.0)
-            
-            # Add small regularization
-            l2_loss = tf.reduce_sum([tf.nn.l2_loss(var) for var in model.trainable_variables 
-                                   if 'bias' not in var.name and 'layer_norm' not in var.name])
-            loss += 1e-6 * l2_loss
+            # Add MoE auxiliary losses (they're automatically added via model.losses)
+            total_loss = loss + tf.reduce_sum(model.losses)
         
-        # Compute and apply gradients
-        gradients = tape.gradient(loss, model.trainable_variables)
-        
-        # Clip gradients
-        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
-        
+        # Compute and apply gradients with clipping
+        gradients = tape.gradient(total_loss, model.trainable_variables)
         optimizer.apply_gradients(zip(gradients, model.trainable_variables))
         
         # Update metrics
-        train_loss.update_state(loss)
-        train_accuracy.update_state(targets, logits, sample_weight=mask)
+        train_loss.update_state(total_loss)
+        train_accuracy.update_state(targets, predictions)
         
-        return loss, tf.reduce_mean(tf.exp(tf.minimum(loss, 10.0)))  # Return loss and perplexity
+        return total_loss
     
-    return train_step, optimizer, train_loss, train_accuracy
+    @tf.function
+    def val_step(batch):
+        inputs = batch['input_ids']
+        targets = batch['target_ids']
+        
+        predictions = model(inputs, training=False)
+        loss = tf.keras.losses.sparse_categorical_crossentropy(
+            targets, predictions, from_logits=True
+        )
+        loss = tf.reduce_mean(loss)
+        
+        # Add MoE auxiliary losses
+        total_loss = loss + tf.reduce_sum(model.losses)
+        
+        # Update validation metrics
+        val_loss.update_state(total_loss)
+        val_accuracy.update_state(targets, predictions)
+        
+        return total_loss
+    
+    return train_step, val_step, optimizer, (train_loss, train_accuracy, val_loss, val_accuracy)
 
-def improved_train_model(model, config):
-    """Improved training function with better monitoring and debugging"""
+def enhanced_train_model(model, config):
+    """Enhanced training function with dataset integration and improved monitoring - FIXED"""
     
-    # Create dataset with your config parameters
-    logger.info("Creating training dataset...")
-    train_dataset, tokenizer = create_simple_text_dataset(
-        vocab_size=config.vocab_size,
-        seq_len=config.seq_len,
-        batch_size=config.batch_size,
-        num_samples=3000  # More samples for longer sequences
-    )
-    
-    val_dataset, _ = create_simple_text_dataset(
-        vocab_size=config.vocab_size,
-        seq_len=config.seq_len,
-        batch_size=config.batch_size,
-        num_samples=300  # Validation samples
-    )
-    
-    # Store tokenizer in model for later use
-    model.tokenizer = tokenizer
+    # Create enhanced datasets
+    logger.info("Creating enhanced training datasets...")
+    try:
+        # Create datasets (tokenizer is handled inside)
+        train_dataset, val_dataset, tokenizer = create_enhanced_dataset(
+            seq_len=config.seq_len,
+            batch_size=config.batch_size,
+            daily_dialogue_samples=1500,  # Reduced for faster training
+            conv2ai_samples=800,
+            include_synthetic=True
+        )
+        
+        # Store tokenizer in model
+        model._tokenizer = tokenizer
+        
+    except Exception as e:
+        logger.error(f"Error creating enhanced datasets: {e}")
+        logger.info("Falling back to simple text dataset...")
+        train_dataset, tokenizer = create_simple_text_dataset(
+            vocab_size=config.vocab_size,
+            seq_len=config.seq_len,
+            batch_size=config.batch_size,
+            num_samples=2000
+        )
+        val_dataset, _ = create_simple_text_dataset(
+            vocab_size=config.vocab_size,
+            seq_len=config.seq_len,
+            batch_size=config.batch_size,
+            num_samples=200
+        )
+        model._tokenizer = tokenizer
     
     # Create training components
-    train_step, optimizer, train_loss, train_accuracy = create_improved_training_function(model, config)
+    train_step, val_step, optimizer, metrics = create_improved_training_function(model, config)
+    train_loss, train_accuracy, val_loss, val_accuracy = metrics
     
     # Create checkpoint directory
-    checkpoint_dir = './improved_checkpoints'
+    checkpoint_dir = './enhanced_checkpoints'
     os.makedirs(checkpoint_dir, exist_ok=True)
     
-    # Training parameters - adjusted for larger model
-    num_epochs = 10  # Fewer epochs for larger model
-    best_loss = float('inf')
+    # Training parameters
+    num_epochs = 15
+    best_val_loss = float('inf')
     patience_counter = 0
-    patience = 8  # Reduced patience for larger model
+    patience = 5
+    
+    # Training history
+    history = {
+        'train_loss': [],
+        'train_accuracy': [],
+        'val_loss': [],
+        'val_accuracy': []
+    }
     
     # Training loop
     for epoch in range(num_epochs):
         logger.info(f"Epoch {epoch + 1}/{num_epochs}")
         
         # Reset metrics
-        train_loss.reset_state()
-        train_accuracy.reset_state()
+        for metric in metrics:
+            metric.reset_state()
         
-        # Training
+        # Training phase
         batch_count = 0
-        epoch_losses = []
-        
         try:
             for batch in train_dataset:
-                loss, perplexity = train_step(batch)
+                loss = train_step(batch)
                 batch_count += 1
-                epoch_losses.append(float(loss))
                 
-                # Log every 25 batches (more frequent for batch_size=1)
-                if batch_count % 25 == 0:
-                    current_loss = float(train_loss.result())
-                    current_acc = float(train_accuracy.result())
+                # Log progress every 50 batches
+                if batch_count % 50 == 0:
                     logger.info(
                         f"Epoch {epoch + 1}, Batch {batch_count}: "
-                        f"Loss: {current_loss:.4f}, "
-                        f"Accuracy: {current_acc:.4f}, "
-                        f"Perplexity: {float(perplexity):.2f}"
+                        f"Loss: {float(train_loss.result()):.4f}, "
+                        f"Accuracy: {float(train_accuracy.result()):.4f}"
                     )
         
         except Exception as e:
-            logger.error(f"Error during training batch: {e}")
+            logger.error(f"Error during training: {e}")
             continue
         
+        # Validation phase
+        val_batch_count = 0
+        try:
+            for batch in val_dataset:
+                val_step(batch)
+                val_batch_count += 1
+                
+        except Exception as e:
+            logger.error(f"Error during validation: {e}")
+        
         # Epoch summary
-        final_loss = float(train_loss.result())
-        final_acc = float(train_accuracy.result())
-        avg_perplexity = np.exp(np.minimum(np.mean(epoch_losses), 10.0))
+        epoch_train_loss = float(train_loss.result())
+        epoch_train_acc = float(train_accuracy.result())
+        epoch_val_loss = float(val_loss.result()) if val_batch_count > 0 else float('inf')
+        epoch_val_acc = float(val_accuracy.result()) if val_batch_count > 0 else 0.0
+        
+        # Store history
+        history['train_loss'].append(epoch_train_loss)
+        history['train_accuracy'].append(epoch_train_acc)
+        history['val_loss'].append(epoch_val_loss)
+        history['val_accuracy'].append(epoch_val_acc)
         
         logger.info(
             f"Epoch {epoch + 1} Summary: "
-            f"Loss: {final_loss:.4f}, "
-            f"Accuracy: {final_acc:.4f}, "
-            f"Perplexity: {avg_perplexity:.2f}"
+            f"Train Loss: {epoch_train_loss:.4f}, "
+            f"Train Acc: {epoch_train_acc:.4f}, "
+            f"Val Loss: {epoch_val_loss:.4f}, "
+            f"Val Acc: {epoch_val_acc:.4f}"
         )
         
-        # Early stopping check
-        if final_loss < best_loss:
-            best_loss = final_loss
+        # Early stopping and model saving
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
             patience_counter = 0
             
             # Save best model
@@ -294,18 +466,26 @@ def improved_train_model(model, config):
                 logger.error(f"Error saving best model: {e}")
         else:
             patience_counter += 1
-            
+        
         # Early stopping
         if patience_counter >= patience:
             logger.info(f"Early stopping triggered after {patience} epochs without improvement")
             break
         
-        # Test generation every 5 epochs (more frequent for larger model)
-        if (epoch + 1) % 5 == 0:
+        # Test generation every 3 epochs
+        if (epoch + 1) % 3 == 0:
             try:
-                test_generation(model, tokenizer, config)
+                test_generation(model, model._tokenizer, config)
             except Exception as e:
                 logger.error(f"Error during test generation: {e}")
+        
+        # Save training history
+        try:
+            history_path = os.path.join(checkpoint_dir, 'training_history.json')
+            with open(history_path, 'w') as f:
+                json.dump(history, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving training history: {e}")
     
     # Load best model
     try:
@@ -316,161 +496,273 @@ def improved_train_model(model, config):
     except Exception as e:
         logger.error(f"Error loading best model: {e}")
     
-    return model
+    return model, history
 
-def test_generation(model, tokenizer, config, max_length=100):
-    """Test text generation with the model"""
+def test_generation(model, tokenizer, config):
+    """Test text generation with the MoEMiniGPT model - FIXED"""
     try:
-        # Test prompts
+        # FIXED: Define max_length
+        max_length = 50
+        
+        # Enhanced test prompts for dialogue and conversation
         test_prompts = [
-            "Hello",
-            "The quick",
-            "Machine learning",
-            "Natural language processing",
-            "Programming is"
+            "Human: Hello, how are you today?",
+            "User: Can you help me with a question?",
+            "Human: What's the weather like?",
+            "Assistant: I'd be happy to help you with",
+            "The conversation started when",
+            "In machine learning,",
+            "Programming is",
+            "Human: I'm feeling stressed about work.\nAssistant:"
         ]
         
-        logger.info("Testing text generation:")
-        
+        logger.info("Testing enhanced text generation:")
         for prompt in test_prompts:
-            # Encode prompt
-            input_ids = tokenizer.encode(prompt)
-            
-            # Pad to minimum length
-            if len(input_ids) < 20:
-                input_ids.extend([0] * (20 - len(input_ids)))
-            
-            # Convert to tensor
-            input_tensor = tf.constant([input_ids[:config.seq_len]], dtype=tf.int32)
-            
-            # Generate
-            generated_ids = []
-            current_input = input_tensor
-            
-            for _ in range(max_length):
-                # Get logits (use seq_len-1 to match training)
-                logits = model(current_input[:, :config.seq_len-1], training=False)
+            try:
+                # Encode prompt
+                input_ids = tokenizer.encode(prompt, add_special_tokens=True)
                 
-                # Get next token (greedy decoding)
-                next_token = tf.argmax(logits[0, -1], axis=-1, output_type=tf.int32)
-                generated_ids.append(int(next_token))
+                # Ensure input doesn't exceed sequence length
+                if len(input_ids) >= config.seq_len:
+                    input_ids = input_ids[:config.seq_len-10]  # Leave room for generation
                 
-                # Update input (sliding window)
-                new_input = tf.concat([current_input[:, 1:], [[next_token]]], axis=1)
-                current_input = new_input
+                # Pad input to match model expectations
+                input_array = np.zeros(config.seq_len, dtype=np.int32)
+                input_array[:len(input_ids)] = input_ids
                 
-                # Stop if end token
-                if int(next_token) == tokenizer.char_to_id.get('<eos>', 3):
-                    break
-            
-            # Decode generated text
-            generated_text = tokenizer.decode(generated_ids)
-            logger.info(f"Prompt: '{prompt}' -> Generated: '{generated_text}'")
-            
+                # Convert to tensor
+                current_input = tf.convert_to_tensor(
+                    input_array[None, :],
+                    dtype=tf.int32
+                )
+                
+                # Generate with improved sampling
+                generated_ids = []
+                current_length = len(input_ids)
+                
+                for _ in range(max_length):
+                    # Ensure we don't exceed sequence length
+                    if current_length >= config.seq_len - 1:
+                        break
+                        
+                    # Get model predictions
+                    logits = model(current_input, training=False)
+                    next_token_logits = logits[0, current_length - 1, :]  # Use current position
+                    
+                    # Apply temperature and top-k sampling
+                    temperature = 0.8
+                    top_k = 50
+                    
+                    # Temperature scaling
+                    next_token_logits = next_token_logits / temperature
+                    
+                    # Top-k filtering
+                    top_k_logits, top_k_indices = tf.nn.top_k(next_token_logits, k=top_k)
+                    next_token_logits = tf.where(
+                        next_token_logits < top_k_logits[-1],
+                        tf.ones_like(next_token_logits) * -1e9,
+                        next_token_logits
+                    )
+                    
+                    # Sample next token
+                    probs = tf.nn.softmax(next_token_logits, axis=-1)
+                    next_token = tf.random.categorical(tf.math.log(probs[None, :] + 1e-10), num_samples=1)[0, 0]
+                    
+                    token_id = int(next_token.numpy())
+                    generated_ids.append(token_id)
+                    
+                    # Update input array
+                    if current_length < config.seq_len:
+                        input_array[current_length] = token_id
+                        current_length += 1
+                    
+                    # Update input tensor (shift left and add new token)
+                    current_input = tf.convert_to_tensor(input_array[None, :], dtype=tf.int32)
+                    
+                    # Stop at end token or newline for dialogue
+                    if token_id == tokenizer.eos_token_id:
+                        break
+                
+                # Decode and display
+                generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                logger.info(f"Prompt: '{prompt}'")
+                logger.info(f"Generated: '{generated_text}'")
+                logger.info("-" * 50)
+                
+            except Exception as e:
+                logger.error(f"Error generating for prompt '{prompt}': {e}")
+                continue
+                
     except Exception as e:
-        logger.error(f"Error in test generation: {e}")
+        logger.error(f"Error in enhanced test generation: {e}")
 
-def debug_model_output(model, config):
-    """Debug function to check model output shapes and values"""
-    logger.info("Debugging model output...")
+def create_simple_text_dataset(vocab_size=50257, seq_len=1024, batch_size=1, num_samples=1000):
+    """Fallback simple text dataset creation - FIXED"""
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        logger.info("Using GPT-2 tokenizer for simple dataset")
+    except ImportError:
+        logger.error("Could not import transformers. Please install with: pip install transformers")
+        raise
+    
+    # Create diverse training texts (enhanced version)
+    training_texts = [
+        "Hello world! How are you today? I hope you are doing well and having a great time learning about natural language processing.",
+        "Human: How can I help you today?\nAssistant: I'm here to help with any questions you might have. What would you like to know?",
+        "The conversation between humans and AI systems is becoming increasingly natural and helpful.",
+        "Machine learning enables computers to learn patterns from data and make intelligent decisions.",
+        "Natural language processing allows computers to understand and generate human language effectively.",
+        "Deep learning models use neural networks to process complex patterns in text and speech.",
+        "Training language models requires large datasets and significant computational resources.",
+        "Transformers have revolutionized the field of natural language understanding and generation.",
+        "Human: What is artificial intelligence?\nAssistant: Artificial intelligence is the simulation of human intelligence in machines.",
+        "The development of conversational AI has made significant progress in recent years.",
+        "User: Can you explain machine learning?\nAI: Machine learning is a subset of AI that learns from data.",
+        "Programming languages like Python are essential for developing AI applications.",
+        "Data science combines statistics, programming, and domain knowledge to extract insights.",
+        "Human: I'm interested in learning about neural networks.\nAssistant: Neural networks are inspired by the human brain.",
+        "The future of AI includes applications in healthcare, education, and many other fields."
+    ] * (num_samples // 15 + 1)
+    
+    def data_generator():
+        for i in range(num_samples):
+            text = training_texts[i % len(training_texts)]
+            
+            # Add variations
+            if i % 4 == 0:
+                text = text.upper()
+            elif i % 4 == 1:
+                text = text.lower()
+            elif i % 4 == 2:
+                text = text.title()
+            
+            try:
+                # Tokenize - FIXED
+                encoded = tokenizer.encode(
+                    text,
+                    add_special_tokens=True,
+                    max_length=seq_len + 1,
+                    truncation=True,
+                    padding='max_length',
+                )
+                
+                # Ensure we have the right length
+                if len(encoded) < seq_len + 1:
+                    encoded = encoded + [tokenizer.pad_token_id] * (seq_len + 1 - len(encoded))
+                elif len(encoded) > seq_len + 1:
+                    encoded = encoded[:seq_len + 1]
+                
+                encoded = np.array(encoded, dtype=np.int32)
+                
+                # Create input/target pairs
+                input_ids = encoded[:-1]
+                target_ids = encoded[1:]
+                
+                yield {
+                    'input_ids': input_ids,
+                    'target_ids': target_ids
+                }
+            except Exception as e:
+                logger.warning(f"Error processing text in simple dataset: {e}")
+                continue
+    
+    # Create dataset
+    dataset = tf.data.Dataset.from_generator(
+        data_generator,
+        output_signature={
+            'input_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32),
+            'target_ids': tf.TensorSpec(shape=(seq_len,), dtype=tf.int32)
+        }
+    )
+    
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE), tokenizer
+
+# Example usage and main execution - FIXED
+if __name__ == "__main__":
+    logger.info("Starting MoEMiniGPT training script...")
     
     try:
-        # Create test input with your config
-        batch_size = config.batch_size
-        seq_len = config.seq_len - 1  # Match training setup
-        test_input = tf.random.uniform(
-            (batch_size, seq_len), 
-            maxval=config.vocab_size, 
-            dtype=tf.int32
+        # Import the MoEMiniGPT and MoEConfig from minigpt_transformer
+        from minigpt_transformer import MoEMiniGPT, MoEConfig
+        
+        # Create configuration
+        config = MoEConfig(
+            vocab_size=50257,
+            max_seq_len=1024,
+            embed_dim=768,
+            num_heads=12,
+            num_layers=12,
+            ffn_dim=3072,
+            dropout=0.1,
+            layer_norm_epsilon=1e-5,
+            use_rotary_embeddings=True,
+            learning_rate=1e-4,
+            batch_size=1,
+            seq_len=1024,
+            num_experts=8,
+            top_k_experts=2,
+            use_moe_layers=[2, 4, 6, 8, 10]  # Use MoE in these layers
         )
         
-        logger.info(f"Test input shape: {test_input.shape}")
-        logger.info(f"Test input values: {test_input[0, :5]}")
+        # Create model
+        logger.info("Initializing MoEMiniGPT model...")
+        model = MoEMiniGPT(config)
         
-        # Forward pass
-        output = model(test_input, training=False)
+        # Initialize model with dummy input
+        dummy_input = tf.random.uniform((1, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
+        _ = model(dummy_input)
         
-        logger.info(f"Model output shape: {output.shape}")
-        logger.info(f"Expected output shape: ({batch_size}, {seq_len}, {config.vocab_size})")
-        logger.info(f"Output logits range: [{tf.reduce_min(output):.4f}, {tf.reduce_max(output):.4f}]")
-        logger.info(f"Output mean: {tf.reduce_mean(output):.4f}")
-        logger.info(f"Output std: {tf.math.reduce_std(output):.4f}")
+        # Log model parameters
+        total_params = model.count_params()
+        logger.info(f"Model initialized with {total_params:,} parameters")
         
-        # Check if model is outputting reasonable probabilities
-        probs = tf.nn.softmax(output, axis=-1)
-        logger.info(f"Max probability: {tf.reduce_max(probs):.4f}")
-        logger.info(f"Min probability: {tf.reduce_min(probs):.4f}")
+        # Train model
+        logger.info("Starting model training...")
+        trained_model, history = enhanced_train_model(model, config)
         
-        # Check if all outputs are the same (indicating no learning)
-        if tf.reduce_std(output) < 1e-6:
-            logger.warning("Model outputs have very low variance - model may not be learning!")
+        # Test generation
+        logger.info("Testing text generation...")
+        test_prompts = [
+            "Human: Hello, how are you today?",
+            "Human: Can you explain what machine learning is?",
+            "Human: Write a short poem about AI."
+        ]
+        
+        for prompt in test_prompts:
+            try:
+                generated_text = trained_model.generate_text(
+                    prompt=prompt,
+                    max_length=100,
+                    temperature=0.7
+                )
+                logger.info(f"\nPrompt: {prompt}")
+                logger.info(f"Generated: {generated_text}")
+            except Exception as e:
+                logger.error(f"Generation error for prompt '{prompt}': {e}")
+        
+        # Save the trained model
+        save_dir = "trained_model"
+        if not os.path.exists(save_dir):
+            os.makedirs(save_dir)
+        
+        try:
+            model_path = os.path.join(save_dir, "moe_minigpt_model.h5")
+            trained_model.save_weights(model_path)
+            logger.info(f"Model saved to {model_path}")
+            
+            # Save training history
+            history_path = os.path.join(save_dir, "training_history.json")
+            with open(history_path, 'w') as f:
+                json.dump(history, f, indent=2)
+            logger.info(f"Training history saved to {history_path}")
+            
+        except Exception as e:
+            logger.error(f"Error saving model: {e}")
+        
+        logger.info("Training completed successfully!")
         
     except Exception as e:
-        logger.error(f"Error in model debugging: {e}")
-
-# Modified main execution with your configuration
-if __name__ == "__main__":
-    # Import your model configuration and class
-    # from minigpt_transformer import EnhancedMiniGPT, ModelConfig
-    
-    # Create model configuration with your specified settings
-    config_dict = {
-        'vocab_size': 50257,
-        'max_seq_len': 512,
-        'embed_dim': 384,
-        'num_heads': 6,
-        'num_layers': 6,
-        'ffn_dim': 1536,
-        'dropout': 0.1,
-        'use_custom_attention': True,
-        'use_rotary_embeddings': True,
-        'learning_rate': 5e-4,
-        'batch_size': 1,
-        'seq_len': 512
-    }
-    
-    # Create a simple config object
-    class SimpleConfig:
-        def __init__(self, **kwargs):
-            for key, value in kwargs.items():
-                setattr(self, key, value)
-    
-    config = SimpleConfig(**config_dict)
-    
-    logger.info("Configuration:")
-    for key, value in config_dict.items():
-        logger.info(f"  {key}: {value}")
-    
-    # Calculate approximate model parameters
-    embed_params = config.vocab_size * config.embed_dim
-    layer_params = config.num_layers * (
-        # Multi-head attention
-        4 * config.embed_dim * config.embed_dim +  # Q, K, V, O projections
-        # Feed-forward network
-        2 * config.embed_dim * config.ffn_dim +
-        # Layer norms (approximate)
-        4 * config.embed_dim
-    )
-    total_params = embed_params + layer_params
-    logger.info(f"Estimated model parameters: {total_params:,}")
-    
-    # If you have the model available, uncomment these lines:
-    # logger.info("Creating model...")
-    # model = EnhancedMiniGPT(config)
-    # 
-    # # Build model
-    # dummy_input = tf.random.uniform((1, config.seq_len-1), maxval=config.vocab_size, dtype=tf.int32)
-    # _ = model(dummy_input)
-    # actual_params = model.count_params()
-    # logger.info(f"Model created with {actual_params:,} parameters")
-    # 
-    # # Debug model
-    # debug_model_output(model, config)
-    # 
-    # # Train model
-    # logger.info("Starting improved training...")
-    # model = improved_train_model(model, config)
-    # 
-    # logger.info("Training completed!")
-    
-    logger.info("Improved training script ready with your configuration. Uncomment the model creation lines to run.")
+        logger.error(f"Error in main execution: {e}")
+        raise
