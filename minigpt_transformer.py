@@ -497,27 +497,32 @@ class MoEMiniGPT(Model):
     def tokenizer(self):
         return self._tokenizer
     
-    def call(self, inputs, mask=None, training=False):
-        """Forward pass of the model."""
-        if isinstance(inputs, dict):
-            input_ids = inputs['input_ids']
-            mask = inputs.get('attention_mask', mask)
-        else:
-            input_ids = inputs
-            
-        seq_len = tf.shape(input_ids)[1]
+def call(self, inputs, mask=None, training=False):
+    """Forward pass of the model."""
+    if isinstance(inputs, dict):
+        input_ids = inputs['input_ids']
+        mask = inputs.get('attention_mask', mask)
+    else:
+        input_ids = inputs
         
-        if training and seq_len > self.config.max_seq_len:
-            logger.warning(f"Input length {seq_len} exceeds max_seq_len {self.config.max_seq_len}")
-        
-        # Get token embeddings
-        x = self.token_embedding(input_ids)
-        
-        # Add positional embeddings if not using rotary
-        if not self.config.use_rotary_embeddings:
-            positions = tf.range(seq_len, dtype=tf.int32)
-            position_embeddings = self.pos_embedding(positions)
-            x = x + position_embeddings
+    seq_len = tf.shape(input_ids)[1]
+    
+    # Simple tensor-based check - no need for complex tf.cond here
+    if training:
+        tf.debugging.assert_less_equal(
+            seq_len,
+            self.config.max_seq_len,
+            message=f"Input length {seq_len} exceeds max_seq_len {self.config.max_seq_len}"
+        )
+    
+    # Get token embeddings
+    x = self.token_embedding(input_ids)
+    
+    # Add positional embeddings if not using rotary
+    if not self.config.use_rotary_embeddings:
+        positions = tf.range(seq_len, dtype=tf.int32)
+        position_embeddings = self.pos_embedding(positions)
+        x = x + position_embeddings
         
         # Apply dropout to embeddings
         x = self.dropout(x, training=training)
