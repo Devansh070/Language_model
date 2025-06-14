@@ -497,47 +497,47 @@ class MoEMiniGPT(Model):
     def tokenizer(self):
         return self._tokenizer
     
-def call(self, inputs, mask=None, training=False):
-    """Forward pass of the model."""
-    if isinstance(inputs, dict):
-        input_ids = inputs['input_ids']
-        mask = inputs.get('attention_mask', mask)
-    else:
-        input_ids = inputs
+    def call(self, inputs, mask=None, training=False):
+        """Forward pass of the model."""
+        if isinstance(inputs, dict):
+            input_ids = inputs['input_ids']
+            mask = inputs.get('attention_mask', mask)
+        else:
+            input_ids = inputs
+            
+        seq_len = tf.shape(input_ids)[1]
         
-    seq_len = tf.shape(input_ids)[1]
-    
-    # Simple tensor-based check - no need for complex tf.cond here
-    if training:
-        tf.debugging.assert_less_equal(
-            seq_len,
-            self.config.max_seq_len,
-            message=f"Input length {seq_len} exceeds max_seq_len {self.config.max_seq_len}"
-        )
-    
-    # Get token embeddings
-    x = self.token_embedding(input_ids)
-    
-    # Add positional embeddings if not using rotary
-    if not self.config.use_rotary_embeddings:
-        positions = tf.range(seq_len, dtype=tf.int32)
-        position_embeddings = self.pos_embedding(positions)
-        x = x + position_embeddings
+        # Simple tensor-based check - no need for complex tf.cond here
+        if training:
+            tf.debugging.assert_less_equal(
+                seq_len,
+                self.config.max_seq_len,
+                message=f"Input length {seq_len} exceeds max_seq_len {self.config.max_seq_len}"
+            )
         
-        # Apply dropout to embeddings
-        x = self.dropout(x, training=training)
+        # Get token embeddings
+        x = self.token_embedding(input_ids)
         
-        # Apply transformer blocks
-        for block in self.transformer_blocks:
-            x = block(x, mask=mask, training=training)
-        
-        # Final layer norm
-        x = self.final_layer_norm(x)
-        
-        # Output projection
-        logits = self.output_projection(x)
-        
-        return logits
+        # Add positional embeddings if not using rotary
+        if not self.config.use_rotary_embeddings:
+            positions = tf.range(seq_len, dtype=tf.int32)
+            position_embeddings = self.pos_embedding(positions)
+            x = x + position_embeddings
+            
+            # Apply dropout to embeddings
+            x = self.dropout(x, training=training)
+            
+            # Apply transformer blocks
+            for block in self.transformer_blocks:
+                x = block(x, mask=mask, training=training)
+            
+            # Final layer norm
+            x = self.final_layer_norm(x)
+            
+            # Output projection
+            logits = self.output_projection(x)
+            
+            return logits
         
     def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7,
                 top_k: int = 50, top_p: float = 0.9, **kwargs):
