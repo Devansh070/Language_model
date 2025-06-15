@@ -93,15 +93,17 @@ if __name__ == "__main__":
 
         # Helper to tokenize and format dataset
         def encode(example):
-            # Try to extract a string from possible fields
             if 'text' in example and isinstance(example['text'], str):
                 text = example['text']
             elif 'utterance' in example and isinstance(example['utterance'], str):
                 text = example['utterance']
             elif 'dialog' in example:
-                # If dialog is a list, join it
+                # If dialog is a list of dicts, extract 'text' from each
                 if isinstance(example['dialog'], list):
-                    text = " ".join(example['dialog'])
+                    if all(isinstance(turn, dict) and 'text' in turn for turn in example['dialog']):
+                        text = " ".join(turn['text'] for turn in example['dialog'])
+                    else:
+                        text = " ".join(str(turn) for turn in example['dialog'])
                 else:
                     text = str(example['dialog'])
             else:
