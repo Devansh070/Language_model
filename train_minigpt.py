@@ -40,8 +40,8 @@ def enhanced_train_model(model, config, train_dataset=None, val_dataset=None, ep
     history = {'train_loss': [], 'val_loss': []}
     for epoch in range(epochs):
         logger.info(f"Epoch {epoch+1}/{epochs}")
-        train_loss_metric.reset_states()
-        val_loss_metric.reset_states()
+        train_loss_metric.reset_state()
+        val_loss_metric.reset_state()
 
         # Training loop
         if train_dataset is not None:
@@ -179,9 +179,9 @@ if __name__ == "__main__":
         logger.info("Starting training...")
         steps = 0
         for epoch in range(1):
-            train_loss_metric.reset_states()
-            train_accuracy_metric.reset_states()
-            train_perplexity_metric.reset_states()
+            train_loss_metric.reset_state()
+            train_accuracy_metric.reset_state()
+            train_perplexity_metric.reset_state()
             for batch in train_dataset:
                 steps += 1
                 loss = train_step(batch)
