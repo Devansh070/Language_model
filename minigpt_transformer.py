@@ -559,70 +559,8 @@ class MoEMiniGPT(Model):
         
         # Output projection
         logits = self.output_projection(x)
-        
-        # Store auxiliary losses for access during training
-        if training:
-            self._aux_losses = total_aux_losses
-        
-        return logits
-        
-    def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7,
-                top_k: int = 50, top_p: float = 0.9, **kwargs):
-        """Generate text using the model with proper sampling."""
-        # Ensure input_ids is int32
-        input_ids = tf.cast(input_ids, tf.int32)
-        
-        if len(input_ids.shape) == 1:
-            input_ids = tf.expand_dims(input_ids, 0)
-        
-        batch_size = tf.shape(input_ids)[0]
-        output_sequence = input_ids
-        
-        for step in range(max_length):
-            current_len = tf.shape(output_sequence)[1]
-            if current_len >= self.config.max_seq_len:
-                output_sequence = output_sequence[:, -self.config.max_seq_len:]
-                
-            logits = self(output_sequence, training=False)
-            next_token_logits = logits[:, -1, :]
-            
-            if temperature != 1.0:
-                next_token_logits = next_token_logits / temperature
-            
-            if top_k > 0:
-                top_k_logits, _ = tf.nn.top_k(next_token_logits, k=top_k)
-                next_token_logits = tf.where(
-                    next_token_logits < top_k_logits[:, -1:],
-                    tf.ones_like(next_token_logits) * -1e9,
-                    next_token_logits
-                )
-            
-            probs = tf.nn.softmax(next_token_logits, axis=-1)
-            next_token = tf.random.categorical(tf.math.log(probs + 1e-10), num_samples=1)
-            next_token = tf.cast(next_token, tf.int32)
-            
-            output_sequence = tf.concat([output_sequence, next_token], axis=1)
-            
-            if self.tokenizer is not None:
-                eos_token_id = self.tokenizer.eos_token_id
-                # Use tf.reduce_any with proper boolean logic
-                if tf.reduce_any(tf.equal(next_token, eos_token_id)).numpy():
-                    break
-        
-        return output_sequence
-        
-    def generate_text(self, prompt: str, max_length: int = 100, temperature: float = 0.7):
-        """Generate text from a string prompt (requires tokenizer)"""
-        if self.tokenizer is None:
-            raise ValueError("Tokenizer not available. Please install transformers package.")
-            
-        input_ids = self.tokenizer.encode(prompt, return_tensors='tf')
-        input_ids = tf.cast(input_ids, tf.int32)
-        output_ids = self.generate(input_ids, max_length=max_length, temperature=temperature)
-        output_text = self.tokenizer.decode(output_ids[0].numpy(), skip_special_tokens=True)
-        
-        return output_text
-        
+        return logits, total_aux_losses
+
     def compute_loss_method(self, input_ids, labels=None):
         """Fixed compute loss method that properly handles auxiliary losses."""
         # Ensure input_ids is int32
@@ -649,7 +587,7 @@ class MoEMiniGPT(Model):
             raise ValueError("Labels cannot be None after processing")
         
         # Get model predictions
-        logits = self(input_for_model, training=True)
+        logits, aux_losses = self(input_for_model, training=True)
         
         # Ensure shapes are compatible
         batch_size = tf.shape(labels)[0]
@@ -683,10 +621,8 @@ class MoEMiniGPT(Model):
         
         # Add auxiliary losses from MoE layers
         auxiliary_loss = 0.0
-        if hasattr(self, '_aux_losses') and self._aux_losses:
-            for loss_name, loss_value in self._aux_losses.items():
-                auxiliary_loss += loss_value
-        
+        if aux_losses:
+            auxiliary_loss = tf.add_n([v for v in aux_losses.values()])
         total_loss = main_loss + auxiliary_loss
         
         return total_loss
