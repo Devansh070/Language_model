@@ -85,27 +85,94 @@ if __name__ == "__main__":
 
         logger.info("Initializing MoEMiniGPT model...")
         model = MoEMiniGPT(config)
-        dummy_input = tf.random.uniform((1, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
-        _ = model(dummy_input)
+        tokenizer = model.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("MoEMiniGPT tokenizer is not available. Please ensure transformers is installed.")
 
-        # Dummy dataset for demonstration (replace with real data loader)
-        def gen():
-            for _ in range(10):
-                arr = np.random.randint(0, config.vocab_size, (config.batch_size, config.seq_len), dtype=np.int32)
-                yield {'input_ids': arr}
-        train_dataset = tf.data.Dataset.from_generator(
-            gen,
-            output_signature={'input_ids': tf.TensorSpec(shape=(config.batch_size, config.seq_len), dtype=tf.int32)}
-        ).batch(config.batch_size)
+        # Helper to tokenize and format dataset
+        def encode(example):
+            text = example['text'] if 'text' in example else example['dialog']
+            tokens = tokenizer.encode(
+                text,
+                max_length=config.seq_len,
+                truncation=True,
+                padding='max_length'
+            )
+            return {'input_ids': np.array(tokens, dtype=np.int32)}
 
-        # Train the model
-        trained_model, history = enhanced_train_model(model, config, train_dataset, epochs=1)
+        # Load and preprocess ConvAI2
+        logger.info("Loading ConvAI2...")
+        convai2 = load_dataset("conv_ai_2", split="train[:1000]")
+        convai2 = convai2.map(encode)
+        convai2_tf = tf.data.Dataset.from_generator(
+            lambda: ({"input_ids": ex["input_ids"]} for ex in convai2),
+            output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
+        )
+
+        # Load and preprocess DailyDialog
+        logger.info("Loading DailyDialog...")
+        dailydialog = load_dataset("daily_dialog", split="train[:1000]")
+        dailydialog = dailydialog.map(lambda ex: {"text": " ".join(ex["dialog"])})
+        dailydialog = dailydialog.map(encode)
+        dailydialog_tf = tf.data.Dataset.from_generator(
+            lambda: ({"input_ids": ex["input_ids"]} for ex in dailydialog),
+            output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
+        )
+
+        # Combine datasets and batch
+        train_dataset = convai2_tf.concatenate(dailydialog_tf).shuffle(2048).batch(config.batch_size)
+
+        # Metrics
+        train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
+        train_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+        train_perplexity_metric = tf.keras.metrics.Mean(name='train_perplexity')
+
+        optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
+
+        @tf.function
+        def train_step(batch):
+            input_ids = batch['input_ids']
+            targets = input_ids[:, 1:]
+            inputs = input_ids[:, :-1]
+            with tf.GradientTape() as tape:
+                logits, aux_losses = model(inputs, training=True)
+                loss = tf.keras.losses.sparse_categorical_crossentropy(
+                    targets, logits, from_logits=True
+                )
+                mask = tf.cast(tf.not_equal(targets, tokenizer.pad_token_id), tf.float32)
+                loss = tf.reduce_sum(loss * mask) / tf.reduce_sum(mask)
+                if aux_losses:
+                    loss += tf.add_n([v for v in aux_losses.values()])
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            train_loss_metric.update_state(loss)
+            train_accuracy_metric.update_state(targets, logits, sample_weight=mask)
+            train_perplexity_metric.update_state(tf.exp(loss))
+            return loss
+
+        # Training loop
+        logger.info("Starting training...")
+        steps = 0
+        for epoch in range(1):
+            train_loss_metric.reset_states()
+            train_accuracy_metric.reset_states()
+            train_perplexity_metric.reset_states()
+            for batch in train_dataset:
+                steps += 1
+                loss = train_step(batch)
+                if steps % 20 == 0:
+                    logger.info(
+                        f"Step {steps} | "
+                        f"Loss: {train_loss_metric.result():.4f} | "
+                        f"Accuracy: {train_accuracy_metric.result():.4f} | "
+                        f"Perplexity: {train_perplexity_metric.result():.4f}"
+                    )
 
         # Save model weights (must end with .weights.h5)
         save_dir = "trained_models"
         os.makedirs(save_dir, exist_ok=True)
         weights_path = os.path.join(save_dir, "moe_minigpt.weights.h5")
-        trained_model.save_weights(weights_path)
+        model.save_weights(weights_path)
         logger.info(f"Model weights saved to {weights_path}")
 
         # Save config
@@ -116,9 +183,9 @@ if __name__ == "__main__":
         logger.info(f"Configuration saved to {config_path}")
 
         # Final generation test (if tokenizer available)
-        if trained_model.tokenizer is not None:
+        if model.tokenizer is not None:
             prompt = "Human: What is a mixture of experts model?"
-            generated = trained_model.generate_text(prompt, max_length=50)
+            generated = model.generate_text(prompt, max_length=50)
             logger.info(f"Prompt: {prompt}\nGenerated: {generated}")
 
     except Exception as e:
