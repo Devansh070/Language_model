@@ -91,7 +91,19 @@ if __name__ == "__main__":
 
         # Helper to tokenize and format dataset
         def encode(example):
-            text = example['text'] if 'text' in example else example['dialog']
+    # Try to extract a string from possible fields
+            if 'text' in example and isinstance(example['text'], str):
+                text = example['text']
+            elif 'utterance' in example and isinstance(example['utterance'], str):
+                text = example['utterance']
+            elif 'dialog' in example:
+                # If dialog is a list, join it
+                if isinstance(example['dialog'], list):
+                    text = " ".join(example['dialog'])
+                else:
+                    text = str(example['dialog'])
+            else:
+                raise ValueError(f"Cannot find a valid text field in example: {example}")
             tokens = tokenizer.encode(
                 text,
                 max_length=config.seq_len,
@@ -101,6 +113,8 @@ if __name__ == "__main__":
             return {'input_ids': np.array(tokens, dtype=np.int32)}
 
         # Load and preprocess ConvAI2
+        logger.info(f"Sample ConvAI2 example: {convai2[0]}")
+        logger.info(f"Sample DailyDialog example: {dailydialog[0]}")
         logger.info("Loading ConvAI2...")
         convai2 = load_dataset("conv_ai_2", split="train[:1000]")
         convai2 = convai2.map(encode)
