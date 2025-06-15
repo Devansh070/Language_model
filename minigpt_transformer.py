@@ -445,10 +445,11 @@ class MoEMiniGPT(Model):
         # Initialize tokenizer if available
         if HAS_TRANSFORMERS:
             try:
-                self._tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                if self._tokenizer.pad_token is None:
-                    self._tokenizer.pad_token = self._tokenizer.eos_token
-                logger.info("Successfully loaded GPT-2 tokenizer")
+                if HAS_TRANSFORMERS:
+                    self._tokenizer = AutoTokenizer.from_pretrained("gpt2")
+                    if self._tokenizer.pad_token is None:
+                        self._tokenizer.pad_token = self._tokenizer.eos_token
+                    logger.info("Successfully loaded GPT-2 tokenizer")
             except Exception as e:
                 logger.warning(f"Failed to load tokenizer: {e}")
                 self._tokenizer = None

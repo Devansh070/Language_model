@@ -21,7 +21,6 @@ def enhanced_train_model(model, config, train_dataset=None, val_dataset=None, ep
     @tf.function
     def train_step(batch):
         with tf.GradientTape() as tape:
-            # Assume batch is a dict with 'input_ids' and optionally 'labels'
             input_ids = batch['input_ids']
             labels = batch.get('labels', None)
             loss = model.compute_loss_method(input_ids, labels)
@@ -45,8 +44,11 @@ def enhanced_train_model(model, config, train_dataset=None, val_dataset=None, ep
         val_loss_metric.reset_states()
 
         # Training loop
-        for batch in train_dataset:
-            train_step(batch)
+        if train_dataset is not None:
+            for batch in train_dataset:
+                train_step(batch)
+        else:
+            logger.warning("train_dataset is None. Skipping training loop.")
 
         # Validation loop
         if val_dataset is not None:
@@ -91,7 +93,7 @@ if __name__ == "__main__":
 
         # Helper to tokenize and format dataset
         def encode(example):
-    # Try to extract a string from possible fields
+            # Try to extract a string from possible fields
             if 'text' in example and isinstance(example['text'], str):
                 text = example['text']
             elif 'utterance' in example and isinstance(example['utterance'], str):
@@ -104,6 +106,8 @@ if __name__ == "__main__":
                     text = str(example['dialog'])
             else:
                 raise ValueError(f"Cannot find a valid text field in example: {example}")
+            if tokenizer is None:
+                raise RuntimeError("Tokenizer is not initialized. Please ensure the model provides a valid tokenizer.")
             tokens = tokenizer.encode(
                 text,
                 max_length=config.seq_len,
@@ -113,23 +117,25 @@ if __name__ == "__main__":
             return {'input_ids': np.array(tokens, dtype=np.int32)}
 
         # Load and preprocess ConvAI2
-        logger.info(f"Sample ConvAI2 example: {convai2[0]}")
-        logger.info(f"Sample DailyDialog example: {dailydialog[0]}")
         logger.info("Loading ConvAI2...")
         convai2 = load_dataset("conv_ai_2", split="train[:1000]")
+        sample_convai2 = next(iter(convai2))
+        logger.info(f"Sample ConvAI2 example: {sample_convai2}")
         convai2 = convai2.map(encode)
         convai2_tf = tf.data.Dataset.from_generator(
-            lambda: ({"input_ids": ex["input_ids"]} for ex in convai2),
+            lambda: ({"input_ids": ex["input_ids"]} for ex in list(convai2)),
             output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
         )
 
         # Load and preprocess DailyDialog
         logger.info("Loading DailyDialog...")
         dailydialog = load_dataset("daily_dialog", split="train[:1000]")
+        sample_dailydialog = next(iter(dailydialog))
+        logger.info(f"Sample DailyDialog example: {sample_dailydialog}")
         dailydialog = dailydialog.map(lambda ex: {"text": " ".join(ex["dialog"])})
         dailydialog = dailydialog.map(encode)
         dailydialog_tf = tf.data.Dataset.from_generator(
-            lambda: ({"input_ids": ex["input_ids"]} for ex in dailydialog),
+            lambda: ({"input_ids": ex["input_ids"]} for ex in list(dailydialog)),
             output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
         )
 
@@ -153,7 +159,10 @@ if __name__ == "__main__":
                 loss = tf.keras.losses.sparse_categorical_crossentropy(
                     targets, logits, from_logits=True
                 )
-                mask = tf.cast(tf.not_equal(targets, tokenizer.pad_token_id), tf.float32)
+                pad_token_id = getattr(tokenizer, "pad_token_id", None)
+                if pad_token_id is None:
+                    pad_token_id = 0  # Default to 0 if pad_token_id is not set
+                mask = tf.cast(tf.not_equal(targets, pad_token_id), tf.float32)
                 loss = tf.reduce_sum(loss * mask) / tf.reduce_sum(mask)
                 if aux_losses:
                     loss += tf.add_n([v for v in aux_losses.values()])
