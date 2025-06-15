@@ -65,8 +65,9 @@ class RotaryPositionalEmbedding(layers.Layer):
     def build(self, input_shape):
         super().build(input_shape)
         
-        # Create position indices
-        position = tf.range(self.max_seq_len, dtype=tf.float32)
+        # Create position indices - ensure int32 dtype
+        position = tf.range(self.max_seq_len, dtype=tf.int32)
+        position = tf.cast(position, tf.float32)
         div_term = tf.exp(tf.range(0, self.dim, 2, dtype=tf.float32) * -(tf.math.log(10000.0) / self.dim))
         
         # Calculate sin and cos values
@@ -213,6 +214,7 @@ class MixtureOfExperts(layers.Layer):
         
         return load_balancing_loss, router_z_loss
     
+    @tf.function
     def call(self, x, training=False):
         """
         Args:
@@ -233,27 +235,31 @@ class MixtureOfExperts(layers.Layer):
         # Initialize output
         output = tf.zeros_like(x)
         
-        # Process each position with its top-k experts
+        # Process each position with its top-k experts using tf.function compatible approach
         for k in range(self.top_k):
             # Get the k-th expert index and weight for each position
             expert_indices = top_k_indices[:, :, k]  # [batch_size, seq_len]
             expert_weights = top_k_probs[:, :, k]    # [batch_size, seq_len]
             
-            # Process each expert
+            # Process each expert using tf.cond for conditional execution
             for expert_idx in range(self.num_experts):
                 # Create mask for positions that route to this expert for this k
                 expert_mask = tf.equal(expert_indices, expert_idx)  # [batch_size, seq_len]
                 
-                if tf.reduce_any(expert_mask):
-                    # Apply expert to all positions (we'll mask the output)
-                    expert_output = self.experts[expert_idx](x, training=training)  # [batch_size, seq_len, embed_dim]
-                    
-                    # Apply mask and weights
-                    expert_mask_expanded = tf.expand_dims(tf.cast(expert_mask, tf.float32), -1)  # [batch_size, seq_len, 1]
-                    weights_expanded = tf.expand_dims(expert_weights, -1)  # [batch_size, seq_len, 1]
-                    
-                    # Add weighted contribution to output
-                    output += expert_output * expert_mask_expanded * weights_expanded
+                # Use tf.cond to conditionally apply expert
+                def apply_expert():
+                    expert_output = self.experts[expert_idx](x, training=training)
+                    expert_mask_expanded = tf.expand_dims(tf.cast(expert_mask, tf.float32), -1)
+                    weights_expanded = tf.expand_dims(expert_weights, -1)
+                    return expert_output * expert_mask_expanded * weights_expanded
+                
+                def skip_expert():
+                    return tf.zeros_like(x)
+                
+                # Check if any element in the mask is True
+                has_tokens = tf.reduce_any(expert_mask)
+                expert_contribution = tf.cond(has_tokens, apply_expert, skip_expert)
+                output += expert_contribution
         
         # Add auxiliary losses
         self.add_loss(load_balancing_loss * self.load_balancing_loss_weight)
@@ -314,8 +320,8 @@ class MultiHeadAttention(layers.Layer):
         
         scores = tf.matmul(q, k, transpose_b=True) * self.scale
         
-        # Create causal mask
-        causal_mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
+        # Create causal mask - ensure int32 dtype
+        causal_mask = tf.linalg.band_part(tf.ones((seq_len, seq_len), dtype=tf.float32), -1, 0)
         causal_mask = tf.where(tf.equal(causal_mask, 0), -1e9, 0.0)
         causal_mask = tf.expand_dims(tf.expand_dims(causal_mask, 0), 0)
         
@@ -505,7 +511,9 @@ class MoEMiniGPT(Model):
             mask = inputs.get('attention_mask', mask)
         else:
             input_ids = inputs
-            
+        
+        # Ensure input_ids is int32
+        input_ids = tf.cast(input_ids, tf.int32)
         seq_len = tf.shape(input_ids)[1]
         
         # Get token embeddings
@@ -535,6 +543,9 @@ class MoEMiniGPT(Model):
     def generate(self, input_ids, max_length: int = 100, temperature: float = 0.7,
                 top_k: int = 50, top_p: float = 0.9, **kwargs):
         """Generate text using the model with proper sampling."""
+        # Ensure input_ids is int32
+        input_ids = tf.cast(input_ids, tf.int32)
+        
         if len(input_ids.shape) == 1:
             input_ids = tf.expand_dims(input_ids, 0)
         
@@ -542,7 +553,8 @@ class MoEMiniGPT(Model):
         output_sequence = input_ids
         
         for step in range(max_length):
-            if tf.shape(output_sequence)[1] >= self.config.max_seq_len:
+            current_len = tf.shape(output_sequence)[1]
+            if current_len >= self.config.max_seq_len:
                 output_sequence = output_sequence[:, -self.config.max_seq_len:]
                 
             logits = self(output_sequence, training=False)
@@ -561,12 +573,14 @@ class MoEMiniGPT(Model):
             
             probs = tf.nn.softmax(next_token_logits, axis=-1)
             next_token = tf.random.categorical(tf.math.log(probs + 1e-10), num_samples=1)
+            next_token = tf.cast(next_token, tf.int32)
             
             output_sequence = tf.concat([output_sequence, next_token], axis=1)
             
             if self.tokenizer is not None:
                 eos_token_id = self.tokenizer.eos_token_id
-                if tf.reduce_any(tf.equal(next_token, eos_token_id)):
+                # Use tf.reduce_any with proper boolean logic
+                if tf.reduce_any(tf.equal(next_token, eos_token_id)).numpy():
                     break
         
         return output_sequence
@@ -577,6 +591,7 @@ class MoEMiniGPT(Model):
             raise ValueError("Tokenizer not available. Please install transformers package.")
             
         input_ids = self.tokenizer.encode(prompt, return_tensors='tf')
+        input_ids = tf.cast(input_ids, tf.int32)
         output_ids = self.generate(input_ids, max_length=max_length, temperature=temperature)
         output_text = self.tokenizer.decode(output_ids[0].numpy(), skip_special_tokens=True)
         
@@ -584,6 +599,9 @@ class MoEMiniGPT(Model):
         
     def compute_loss(self, input_ids, labels=None):
         """Compute the loss for training including MoE auxiliary losses."""
+        # Ensure input_ids is int32
+        input_ids = tf.cast(input_ids, tf.int32)
+        
         # Ensure input_ids is properly shaped
         if len(input_ids.shape) == 1:
             input_ids = tf.expand_dims(input_ids, 0)
@@ -594,7 +612,8 @@ class MoEMiniGPT(Model):
             input_for_model = input_ids[:, :-1]  # All tokens except last
             labels = input_ids[:, 1:]            # All tokens except first (shifted)
         else:
-            # Labels provided explicitly - ensure proper shape
+            # Labels provided explicitly - ensure proper shape and dtype
+            labels = tf.cast(labels, tf.int32)
             if len(labels.shape) == 1:
                 labels = tf.expand_dims(labels, 0)
             input_for_model = input_ids
@@ -627,10 +646,11 @@ class MoEMiniGPT(Model):
         )
         
         # Apply mask to ignore padded positions
-        if tf.reduce_any(valid_mask):
+        num_valid = tf.reduce_sum(tf.cast(valid_mask, tf.float32))
+        if tf.greater(num_valid, 0):
             # Only compute loss on valid tokens
             masked_losses = tf.where(valid_mask, losses, 0.0)
-            main_loss = tf.reduce_sum(masked_losses) / tf.maximum(tf.reduce_sum(tf.cast(valid_mask, tf.float32)), 1.0)
+            main_loss = tf.reduce_sum(masked_losses) / tf.maximum(num_valid, 1.0)
         else:
             # If no valid mask, compute mean loss
             main_loss = tf.reduce_mean(losses)
@@ -641,91 +661,165 @@ class MoEMiniGPT(Model):
         
         return total_loss
 
-    def get_expert_utilization_stats(self):
-        """Get statistics about expert utilization across MoE layers."""
-        stats = {}
+    def get_expert_utilization(self):
+        """Get expert utilization statistics from MoE layers."""
+        utilization_stats = {}
+        
         for i, block in enumerate(self.transformer_blocks):
-            if hasattr(block, 'use_moe') and block.use_moe:
-                stats[f'layer_{i}'] = {
-                    'num_experts': self.config.num_experts,
-                    'top_k': self.config.top_k_experts,
-                    'layer_type': 'MoE'
+            if hasattr(block, 'ffn') and hasattr(block.ffn, 'router'):
+                layer_name = f"layer_{i}"
+                utilization_stats[layer_name] = {
+                    'is_moe_layer': True,
+                    'num_experts': block.ffn.num_experts,
+                    'top_k': block.ffn.top_k
                 }
             else:
-                stats[f'layer_{i}'] = {
-                    'layer_type': 'Standard FFN'
+                layer_name = f"layer_{i}"
+                utilization_stats[layer_name] = {
+                    'is_moe_layer': False
                 }
-        return stats
+        
+        return utilization_stats
+    
+    def get_model_info(self):
+        """Get comprehensive model information."""
+        total_params = sum([tf.reduce_prod(var.shape) for var in self.trainable_variables])
+        
+        moe_layers = [i for i in range(self.config.num_layers) if i in self.config.use_moe_layers]
+        standard_layers = [i for i in range(self.config.num_layers) if i not in self.config.use_moe_layers]
+        
+        info = {
+            'model_type': 'MoE MiniGPT',
+            'total_parameters': int(total_params),
+            'vocab_size': self.config.vocab_size,
+            'embed_dim': self.config.embed_dim,
+            'num_layers': self.config.num_layers,
+            'num_heads': self.config.num_heads,
+            'max_seq_len': self.config.max_seq_len,
+            'moe_config': {
+                'num_experts': self.config.num_experts,
+                'top_k_experts': self.config.top_k_experts,
+                'moe_layers': moe_layers,
+                'standard_layers': standard_layers,
+                'expert_capacity': self.config.expert_capacity
+            },
+            'tokenizer_available': self.tokenizer is not None
+        }
+        
+        return info
+    
+    def save_model(self, filepath: str):
+        """Save model weights and configuration."""
+        # Save model weights
+        self.save_weights(filepath + '_weights')
+        
+        # Save configuration
+        config_dict = {
+            'vocab_size': self.config.vocab_size,
+            'max_seq_len': self.config.max_seq_len,
+            'embed_dim': self.config.embed_dim,
+            'num_heads': self.config.num_heads,
+            'num_layers': self.config.num_layers,
+            'ffn_dim': self.config.ffn_dim,
+            'dropout': self.config.dropout,
+            'layer_norm_epsilon': self.config.layer_norm_epsilon,
+            'use_rotary_embeddings': self.config.use_rotary_embeddings,
+            'num_experts': self.config.num_experts,
+            'top_k_experts': self.config.top_k_experts,
+            'expert_capacity': self.config.expert_capacity,
+            'load_balancing_loss_weight': self.config.load_balancing_loss_weight,
+            'router_z_loss_weight': self.config.router_z_loss_weight,
+            'use_moe_layers': self.config.use_moe_layers
+        }
+        
+        with open(filepath + '_config.json', 'w') as f:
+            json.dump(config_dict, f, indent=2)
+        
+        logger.info(f"Model saved to {filepath}")
+    
+    @classmethod
+    def load_model(cls, filepath: str):
+        """Load model from saved weights and configuration."""
+        # Load configuration
+        with open(filepath + '_config.json', 'r') as f:
+            config_dict = json.load(f)
+        
+        config = MoEConfig(**config_dict)
+        model = cls(config)
+        
+        # Build model by calling it with dummy input
+        dummy_input = tf.ones((1, config.max_seq_len), dtype=tf.int32)
+        _ = model(dummy_input)
+        
+        # Load weights
+        model.load_weights(filepath + '_weights')
+        
+        logger.info(f"Model loaded from {filepath}")
+        return model
 
-# Utility functions
-def create_moe_model(config: MoEConfig = None) -> MoEMiniGPT:
-    """Create and return a MoE MiniGPT model with the given configuration."""
-    if config is None:
-        config = MoEConfig()
+
+# Example usage
+def create_sample_model():
+    """Create a sample MoE MiniGPT model for testing."""
+    config = MoEConfig(
+        vocab_size=50257,
+        max_seq_len=512,
+        embed_dim=384,
+        num_heads=6,
+        num_layers=6,
+        ffn_dim=1536,
+        num_experts=4,
+        top_k_experts=2,
+        use_moe_layers=[2, 4],  # Use MoE in layers 2 and 4
+        batch_size=2,
+        seq_len=512
+    )
     
     model = MoEMiniGPT(config)
     
-    # Build model by calling it with dummy input
-    dummy_input = tf.random.uniform((1, config.seq_len), maxval=config.vocab_size, dtype=tf.int32)
+    # Build the model
+    dummy_input = tf.ones((1, config.max_seq_len), dtype=tf.int32)
     _ = model(dummy_input)
     
-    logger.info(f"Created MoE MiniGPT model with {model.count_params():,} parameters")
-    
-    # Log model configuration
-    logger.info("Model configuration:")
-    logger.info(f"  Vocab size: {config.vocab_size}")
-    logger.info(f"  Sequence length: {config.seq_len}")
-    logger.info(f"  Embedding dimension: {config.embed_dim}")
-    logger.info(f"  Number of heads: {config.num_heads}")
-    logger.info(f"  Number of layers: {config.num_layers}")
-    logger.info(f"  Number of experts: {config.num_experts}")
-    logger.info(f"  Top-k experts: {config.top_k_experts}")
-    logger.info(f"  MoE layers: {config.use_moe_layers}")
-    
-    # Log expert utilization statistics
-    expert_stats = model.get_expert_utilization_stats()
-    logger.info("\nExpert utilization by layer:")
-    for layer, stats in expert_stats.items():
-        logger.info(f"  {layer}: {stats}")
+    logger.info("Sample MoE MiniGPT model created successfully!")
+    logger.info(f"Model info: {model.get_model_info()}")
     
     return model
 
-if __name__ == "__main__":
-    # Create and test model
-    logger.info("Testing MoE MiniGPT model creation...")
-    
-    try:
-        # Create configuration
-        config = MoEConfig(
-            vocab_size=50257,
-            max_seq_len=1024,
-            embed_dim=768,
-            num_heads=12,
-            num_layers=12,
-            ffn_dim=3072,
-            dropout=0.1,
-            num_experts=8,
-            top_k_experts=2,
-            use_moe_layers=[2, 4, 6, 8, 10]
-        )
-        
-        # Create model
-        model = create_moe_model(config)
-        
-        # Test generation if tokenizer is available
-        if model.tokenizer is not None:
-            test_prompt = "The future of artificial intelligence"
-            logger.info(f"\nTesting generation with prompt: '{test_prompt}'")
-            
-            generated_text = model.generate_text(
-                prompt=test_prompt,
-                max_length=50,
-                temperature=0.7
+
+def create_dummy_dataset(vocab_size: int = 50257, seq_len: int = 512, 
+                        batch_size: int = 2, num_batches: int = 100):
+    """Create a dummy dataset for testing."""
+    def generator():
+        for _ in range(num_batches):
+            # Generate random token sequences
+            batch = tf.random.uniform(
+                (batch_size, seq_len), 
+                minval=0, 
+                maxval=vocab_size, 
+                dtype=tf.int32
             )
-            logger.info(f"Generated text: {generated_text}")
-        
-        logger.info("Model testing completed successfully!")
-        
-    except Exception as e:
-        logger.error(f"Error during model testing: {e}")
-        raise
+            yield batch
+    
+    dataset = tf.data.Dataset.from_generator(
+        generator,
+        output_signature=tf.TensorSpec(shape=(batch_size, seq_len), dtype=tf.int32)
+    )
+    
+    return dataset
+
+
+if __name__ == "__main__":
+    # Example usage
+    model = create_sample_model()
+    
+    # Generate some text if tokenizer is available
+    if model.tokenizer is not None:
+        sample_text = model.generate_text("Hello, this is a test", max_length=50)
+        print(f"Generated text: {sample_text}")
+    else:
+        print("Tokenizer not available. Model created successfully but text generation requires transformers library.")
+    
+    # Display model information
+    print(f"Model info: {model.get_model_info()}")
+    print(f"Expert utilization: {model.get_expert_utilization()}")
