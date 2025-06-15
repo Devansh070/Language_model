@@ -221,6 +221,7 @@ class MixtureOfExperts(layers.Layer):
             x: [batch_size, seq_len, embed_dim]
         Returns:
             output: [batch_size, seq_len, embed_dim]
+            aux_losses: dict with auxiliary losses
         """
         batch_size = tf.shape(x)[0]
         seq_len = tf.shape(x)[1]
@@ -261,11 +262,13 @@ class MixtureOfExperts(layers.Layer):
                 expert_contribution = tf.cond(has_tokens, apply_expert, skip_expert)
                 output += expert_contribution
         
-        # Add auxiliary losses
-        self.add_loss(load_balancing_loss * self.load_balancing_loss_weight)
-        self.add_loss(router_z_loss * self.router_z_loss_weight)
+        # Return output and auxiliary losses as a tuple
+        aux_losses = {
+            'load_balancing_loss': load_balancing_loss * self.load_balancing_loss_weight,
+            'router_z_loss': router_z_loss * self.router_z_loss_weight
+        }
         
-        return output
+        return output, aux_losses
 
 class MultiHeadAttention(layers.Layer):
     """Multi-head attention layer with optional rotary embeddings"""
@@ -418,11 +421,18 @@ class MoETransformerBlock(layers.Layer):
         
         # Pre-norm feed-forward with residual connection
         ffn_input = self.ln2(x)
-        ffn_output = self.ffn(ffn_input, training=training)
-        ffn_output = self.dropout2(ffn_output, training=training)
-        x = x + ffn_output
         
-        return x
+        if self.use_moe:
+            ffn_output, aux_losses = self.ffn(ffn_input, training=training)
+            # Return auxiliary losses along with the output
+            ffn_output = self.dropout2(ffn_output, training=training)
+            x = x + ffn_output
+            return x, aux_losses
+        else:
+            ffn_output = self.ffn(ffn_input, training=training)
+            ffn_output = self.dropout2(ffn_output, training=training)
+            x = x + ffn_output
+            return x, {}
 
 class MoEMiniGPT(Model):
     """MiniGPT model with Mixture of Experts."""
@@ -505,7 +515,7 @@ class MoEMiniGPT(Model):
         return self._tokenizer
     
     def call(self, inputs, mask=None, training=False):
-        """Forward pass of the model."""
+        """Fixed forward pass that properly handles auxiliary losses."""
         if isinstance(inputs, dict):
             input_ids = inputs['input_ids']
             mask = inputs.get('attention_mask', mask)
@@ -528,15 +538,31 @@ class MoEMiniGPT(Model):
         # Apply dropout to embeddings
         x = self.dropout(x, training=training)
         
+        # Collect auxiliary losses
+        total_aux_losses = {}
+        
         # Apply transformer blocks
         for block in self.transformer_blocks:
-            x = block(x, mask=mask, training=training)
+            if hasattr(block, 'use_moe') and block.use_moe:
+                x, aux_losses = block(x, mask=mask, training=training)
+                # Accumulate auxiliary losses
+                for loss_name, loss_value in aux_losses.items():
+                    if loss_name in total_aux_losses:
+                        total_aux_losses[loss_name] += loss_value
+                    else:
+                        total_aux_losses[loss_name] = loss_value
+            else:
+                x, _ = block(x, mask=mask, training=training)
         
         # Final layer norm
         x = self.final_layer_norm(x)
         
         # Output projection
         logits = self.output_projection(x)
+        
+        # Store auxiliary losses for access during training
+        if training:
+            self._aux_losses = total_aux_losses
         
         return logits
         
@@ -597,8 +623,8 @@ class MoEMiniGPT(Model):
         
         return output_text
         
-    def compute_loss(self, input_ids, labels=None):
-        """Compute the loss for training including MoE auxiliary losses."""
+    def compute_loss_method(self, input_ids, labels=None):
+        """Fixed compute loss method that properly handles auxiliary losses."""
         # Ensure input_ids is int32
         input_ids = tf.cast(input_ids, tf.int32)
         
@@ -656,8 +682,12 @@ class MoEMiniGPT(Model):
             main_loss = tf.reduce_mean(losses)
         
         # Add auxiliary losses from MoE layers
-        auxiliary_losses = tf.reduce_sum(self.losses) if self.losses else 0.0
-        total_loss = main_loss + auxiliary_losses
+        auxiliary_loss = 0.0
+        if hasattr(self, '_aux_losses') and self._aux_losses:
+            for loss_name, loss_value in self._aux_losses.items():
+                auxiliary_loss += loss_value
+        
+        total_loss = main_loss + auxiliary_loss
         
         return total_loss
 
