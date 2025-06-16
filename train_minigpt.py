@@ -107,6 +107,10 @@ if __name__ == "__main__":
         if tokenizer is None:
             raise RuntimeError("MoEMiniGPT tokenizer is not available. Please ensure transformers is installed.")
 
+        # Build the model
+        dummy_input = tf.ones((1, config.seq_len), dtype=tf.int32)
+        _ = model(dummy_input)  # Build the model
+
         # Display total number of model parameters
         total_params = np.sum([np.prod(v.shape) for v in model.trainable_variables])
         logger.info(f"Total model parameters: {total_params:,}")
@@ -232,17 +236,19 @@ if __name__ == "__main__":
         # Training loop
         logger.info("Starting training...")
         steps_per_epoch = tf.data.experimental.cardinality(train_dataset).numpy()
-        logger.info(f"Steps per epoch: {steps_per_epoch}")
+        if steps_per_epoch < 0:
+            logger.info("Steps per epoch: Unknown (dataset is a generator or infinite)")
+        else:
+            logger.info(f"Steps per epoch: {steps_per_epoch}")
 
         steps = 0
-        for epoch in range(1):
+        for epoch in range(5):  # Train for 5 epochs
             train_loss_metric.reset_state()
             train_accuracy_metric.reset_state()
             train_perplexity_metric.reset_state()
             for batch in train_dataset:
                 steps += 1
                 loss = train_step(batch)
-                # Get metric values and replace NaN with 0.0 for logging
                 loss_val = train_loss_metric.result().numpy()
                 perplexity_val = train_perplexity_metric.result().numpy()
                 if math.isnan(loss_val):
@@ -250,9 +256,12 @@ if __name__ == "__main__":
                 if math.isnan(perplexity_val):
                     perplexity_val = 0.0
                 if steps % 20 == 0:
+                    if steps_per_epoch < 0:
+                        step_str = f"Epoch {epoch+1} | Step ? | Global Step {steps}"
+                    else:
+                        step_str = f"Epoch {epoch+1} | Step {steps % steps_per_epoch}/{steps_per_epoch} | Global Step {steps}"
                     logger.info(
-                        f"Epoch {epoch+1} | Step {steps % steps_per_epoch}/{steps_per_epoch} | "
-                        f"Global Step {steps} | "
+                        f"{step_str} | "
                         f"Loss: {loss_val:.4f} | "
                         f"Accuracy: {train_accuracy_metric.result():.4f} | "
                         f"Perplexity: {perplexity_val:.4f}"

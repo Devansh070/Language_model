@@ -650,6 +650,10 @@ class MoEMiniGPT(Model):
     
     def get_model_info(self):
         """Get comprehensive model information."""
+        # Ensure model is built
+        if not self.built:
+            dummy_input = tf.ones((1, self.config.max_seq_len), dtype=tf.int32)
+            _ = self(dummy_input)
         total_params = sum([tf.reduce_prod(var.shape) for var in self.trainable_variables])
         
         moe_layers = [i for i in range(self.config.num_layers) if i in self.config.use_moe_layers]
@@ -779,14 +783,20 @@ def create_dummy_dataset(vocab_size: int = 50257, seq_len: int = 512,
 if __name__ == "__main__":
     # Example usage
     model = create_sample_model()
-    
-    # Generate some text if tokenizer is available
-    if model.tokenizer is not None:
-        sample_text = model.generate_text("Hello, this is a test", max_length=50)
-        print(f"Generated text: {sample_text}")
+
+    # Interactive chat loop
+    if model.tokenizer is not None and hasattr(model, "generate_text"):
+        print("MiniGPT Chat! Type 'quit' to exit.")
+        while True:
+            user_input = input("You: ")
+            if user_input.strip().lower() == "quit":
+                print("Exiting chat.")
+                break
+            response = model.generate_text(user_input, max_length=50)
+            print(f"MiniGPT: {response}")
     else:
-        print("Tokenizer not available. Model created successfully but text generation requires transformers library.")
-    
+        print("Tokenizer not available or generate_text not implemented. Model created successfully but text generation requires transformers library.")
+
     # Display model information
     print(f"Model info: {model.get_model_info()}")
     print(f"Expert utilization: {model.get_expert_utilization()}")
