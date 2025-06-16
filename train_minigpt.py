@@ -6,65 +6,15 @@ from datasets import load_dataset
 import random
 import json
 import math
+from tokenizers import ByteLevelBPETokenizer
+from transformers import PreTrainedTokenizerFast
+from tqdm import tqdm
 
 from minigpt_transformer import MoEMiniGPT, MoEConfig
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-def enhanced_train_model(model, config, train_dataset=None, val_dataset=None, epochs=1):
-    """Train the MoEMiniGPT model with auxiliary losses."""
-    optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
-    train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
-    val_loss_metric = tf.keras.metrics.Mean(name='val_loss')
-
-    @tf.function
-    def train_step(batch):
-        with tf.GradientTape() as tape:
-            input_ids = batch['input_ids']
-            labels = batch.get('labels', None)
-            loss = model.compute_loss_method(input_ids, labels)
-        gradients = tape.gradient(loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-        train_loss_metric.update_state(loss)
-        return loss
-
-    @tf.function
-    def val_step(batch):
-        input_ids = batch['input_ids']
-        labels = batch.get('labels', None)
-        loss = model.compute_loss_method(input_ids, labels)
-        val_loss_metric.update_state(loss)
-        return loss
-
-    history = {'train_loss': [], 'val_loss': []}
-    for epoch in range(epochs):
-        logger.info(f"Epoch {epoch+1}/{epochs}")
-        train_loss_metric.reset_state()
-        val_loss_metric.reset_state()
-
-        # Training loop
-        if train_dataset is not None:
-            for batch in train_dataset:
-                train_step(batch)
-        else:
-            logger.warning("train_dataset is None. Skipping training loop.")
-
-        # Validation loop
-        if val_dataset is not None:
-            for batch in val_dataset:
-                val_step(batch)
-            val_loss = val_loss_metric.result().numpy()
-        else:
-            val_loss = None
-
-        train_loss = train_loss_metric.result().numpy()
-        logger.info(f"Train Loss: {train_loss:.4f}" + (f" | Val Loss: {val_loss:.4f}" if val_loss is not None else ""))
-        history['train_loss'].append(train_loss)
-        history['val_loss'].append(val_loss if val_loss is not None else float('nan'))
-
-    return model, history
 
 def make_synthetic_tf_dataset(synthetic_texts, tokenizer, config, repeat=100):
     def synthetic_gen():
@@ -83,8 +33,21 @@ def make_synthetic_tf_dataset(synthetic_texts, tokenizer, config, repeat=100):
 
 if __name__ == "__main__":
     try:
+        # Load custom tokenizer for data encoding
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=ByteLevelBPETokenizer(
+                vocab="my-10k-bpe-tokenizer/vocab.json",
+                merges="my-10k-bpe-tokenizer/merges.txt",
+            ),
+            unk_token="<unk>",
+            pad_token="<pad>",
+            bos_token="<s>",
+            eos_token="</s>",
+            mask_token="<mask>",
+        )
+
         config = MoEConfig(
-            vocab_size=50257,
+            vocab_size=10000,
             max_seq_len=1024,
             embed_dim=768,
             num_heads=12,
@@ -103,7 +66,6 @@ if __name__ == "__main__":
 
         logger.info("Initializing MoEMiniGPT model...")
         model = MoEMiniGPT(config)
-        tokenizer = model.tokenizer
         if tokenizer is None:
             raise RuntimeError("MoEMiniGPT tokenizer is not available. Please ensure transformers is installed.")
 
@@ -233,39 +195,33 @@ if __name__ == "__main__":
             train_perplexity_metric.update_state(tf.exp(loss))
             return loss
 
-        # Training loop
+        # Training loop with progress bar and metrics
         logger.info("Starting training...")
+        epochs = 5
         steps_per_epoch = tf.data.experimental.cardinality(train_dataset).numpy()
-        if steps_per_epoch < 0:
-            logger.info("Steps per epoch: Unknown (dataset is a generator or infinite)")
-        else:
-            logger.info(f"Steps per epoch: {steps_per_epoch}")
+        logger.info(f"Epochs: {epochs}, Steps per epoch: {steps_per_epoch}")
 
-        steps = 0
-        for epoch in range(5):  # Train for 5 epochs
+        global_step = 0
+        for epoch in range(epochs):
             train_loss_metric.reset_state()
             train_accuracy_metric.reset_state()
             train_perplexity_metric.reset_state()
-            for batch in train_dataset:
-                steps += 1
+            progbar = tqdm(train_dataset, total=steps_per_epoch, desc=f"Epoch {epoch+1}/{epochs}", ncols=100)
+            for batch in progbar:
+                global_step += 1
                 loss = train_step(batch)
                 loss_val = train_loss_metric.result().numpy()
+                acc_val = train_accuracy_metric.result().numpy()
                 perplexity_val = train_perplexity_metric.result().numpy()
-                if math.isnan(loss_val):
-                    loss_val = 0.0
-                if math.isnan(perplexity_val):
-                    perplexity_val = 0.0
-                if steps % 20 == 0:
-                    if steps_per_epoch < 0:
-                        step_str = f"Epoch {epoch+1} | Step ? | Global Step {steps}"
-                    else:
-                        step_str = f"Epoch {epoch+1} | Step {steps % steps_per_epoch}/{steps_per_epoch} | Global Step {steps}"
-                    logger.info(
-                        f"{step_str} | "
-                        f"Loss: {loss_val:.4f} | "
-                        f"Accuracy: {train_accuracy_metric.result():.4f} | "
-                        f"Perplexity: {perplexity_val:.4f}"
-                    )
+                progbar.set_postfix({
+                    "loss": f"{loss_val:.4f}",
+                    "acc": f"{acc_val:.4f}",
+                    "ppl": f"{perplexity_val:.2f}"
+                })
+            logger.info(
+                f"Epoch {epoch+1}/{epochs} - Loss: {loss_val:.4f} | "
+                f"Accuracy: {acc_val:.4f} | Perplexity: {perplexity_val:.2f}"
+            )
 
         # Save model weights (must end with .weights.h5)
         save_dir = "trained_models"

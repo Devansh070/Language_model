@@ -8,6 +8,8 @@ import logging
 import time
 import math
 import json
+from tokenizers import ByteLevelBPETokenizer
+from transformers import PreTrainedTokenizerFast
 
 # Optional: only import if transformers is available
 try:
@@ -437,23 +439,29 @@ class MoETransformerBlock(layers.Layer):
 class MoEMiniGPT(Model):
     """MiniGPT model with Mixture of Experts."""
     
-    def __init__(self, config: MoEConfig = None, **kwargs):
+    def __init__(self, config: MoEConfig = None, tokenizer_path="my-10k-bpe-tokenizer", **kwargs):
         super().__init__(**kwargs)
         self.config = config or MoEConfig()
         self._tokenizer = None
-        
-        # Initialize tokenizer if available
-        if HAS_TRANSFORMERS:
-            try:
-                if HAS_TRANSFORMERS:
-                    self._tokenizer = AutoTokenizer.from_pretrained("gpt2")
-                    if self._tokenizer.pad_token is None:
-                        self._tokenizer.pad_token = self._tokenizer.eos_token
-                    logger.info("Successfully loaded GPT-2 tokenizer")
-            except Exception as e:
-                logger.warning(f"Failed to load tokenizer: {e}")
-                self._tokenizer = None
-        
+
+        # Load custom ByteLevelBPETokenizer
+        try:
+            tokenizer = ByteLevelBPETokenizer(
+                vocab=f"{tokenizer_path}/vocab.json",
+                merges=f"{tokenizer_path}/merges.txt",
+            )
+            self._tokenizer = PreTrainedTokenizerFast(
+                tokenizer_object=tokenizer,
+                unk_token="<unk>",
+                pad_token="<pad>",
+                bos_token="<s>",
+                eos_token="</s>",
+                mask_token="<mask>",
+            )
+        except Exception as e:
+            print(f"Failed to load custom tokenizer: {e}")
+            self._tokenizer = None
+
         # Build model layers
         self._build_layers()
         
@@ -728,12 +736,32 @@ class MoEMiniGPT(Model):
         logger.info(f"Model loaded from {filepath}")
         return model
 
+    def generate_text(self, prompt, max_length=50, temperature=1.0):
+        """
+        Simple greedy text generation for demonstration.
+        """
+        if self.tokenizer is None:
+            raise RuntimeError("Tokenizer is not available for text generation.")
+        input_ids = self.tokenizer.encode(
+            prompt, return_tensors="tf", max_length=self.config.max_seq_len, truncation=True
+        )
+        for _ in range(max_length):
+            logits, _ = self(input_ids)
+            logits = logits[:, -1, :] / temperature
+            next_token_id = tf.argmax(logits, axis=-1, output_type=tf.int32)
+            next_token_id = tf.expand_dims(next_token_id, axis=-1)
+            input_ids = tf.concat([input_ids, next_token_id], axis=-1)
+            # Stop if EOS token is generated
+            if hasattr(self.tokenizer, "eos_token_id") and next_token_id[0, 0].numpy() == self.tokenizer.eos_token_id:
+                break
+        output_ids = input_ids.numpy()[0]
+        return self.tokenizer.decode(output_ids, skip_special_tokens=True)
 
 # Example usage
 def create_sample_model():
     """Create a sample MoE MiniGPT model for testing."""
     config = MoEConfig(
-        vocab_size=50257,
+        vocab_size=10000,  # Set vocab size to 10000
         max_seq_len=512,
         embed_dim=384,
         num_heads=6,
@@ -741,24 +769,19 @@ def create_sample_model():
         ffn_dim=1536,
         num_experts=4,
         top_k_experts=2,
-        use_moe_layers=[2, 4],  # Use MoE in layers 2 and 4
+        use_moe_layers=[2, 4],
         batch_size=2,
         seq_len=512
     )
-    
-    model = MoEMiniGPT(config)
-    
-    # Build the model
+    model = MoEMiniGPT(config, tokenizer_path="my-10k-bpe-tokenizer")
     dummy_input = tf.ones((1, config.max_seq_len), dtype=tf.int32)
     _ = model(dummy_input)
-    
     logger.info("Sample MoE MiniGPT model created successfully!")
     logger.info(f"Model info: {model.get_model_info()}")
-    
     return model
 
 
-def create_dummy_dataset(vocab_size: int = 50257, seq_len: int = 512, 
+def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 512, 
                         batch_size: int = 2, num_batches: int = 100):
     """Create a dummy dataset for testing."""
     def generator():
@@ -800,3 +823,4 @@ if __name__ == "__main__":
     # Display model information
     print(f"Model info: {model.get_model_info()}")
     print(f"Expert utilization: {model.get_expert_utilization()}")
+
