@@ -43,12 +43,22 @@ with open(corpus_path, "w", encoding="utf-8") as f:
 
 # Train a Byte Pair Encoding (BPE) tokenizer
 tokenizer = ByteLevelBPETokenizer()
-tokenizer.train(files=corpus_path, vocab_size=10000, min_frequency=2, special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"])
+tokenizer.train(
+    files=corpus_path,
+    vocab_size=10000,
+    min_frequency=2,
+    special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"]
+)
 
 # Save the tokenizer
 save_dir = "my-10k-bpe-tokenizer"
 Path(save_dir).mkdir(exist_ok=True)
 tokenizer.save_model(save_dir)
+
+# Save as HuggingFace tokenizer JSON for compatibility
+tokenizer_json_path = str(Path(save_dir) / "tokenizer.json")
+tokenizer.save(tokenizer_json_path)
+print(f"Saved HuggingFace-compatible tokenizer.json to {tokenizer_json_path}")
 
 print(f"BPE tokenizer trained and saved to {save_dir}/")
 print(f"Number of tokens in vocab: {tokenizer.get_vocab_size()}")

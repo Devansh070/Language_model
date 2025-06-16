@@ -34,8 +34,8 @@ def make_synthetic_tf_dataset(synthetic_texts, tokenizer, config, repeat=100):
 if __name__ == "__main__":
     try:
         # Load custom tokenizer for data encoding
-        tokenizer = PreTrainedTokenizerFast.from_pretrained(
-            "my-10k-bpe-tokenizer",
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file="my-10k-bpe-tokenizer/tokenizer.json",
             unk_token="<unk>",
             pad_token="<pad>",
             bos_token="<s>",
