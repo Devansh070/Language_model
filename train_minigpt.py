@@ -34,18 +34,15 @@ def make_synthetic_tf_dataset(synthetic_texts, tokenizer, config, repeat=100):
 if __name__ == "__main__":
     try:
         # Load custom tokenizer for data encoding
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=ByteLevelBPETokenizer(
-                vocab="my-10k-bpe-tokenizer/vocab.json",
-                merges="my-10k-bpe-tokenizer/merges.txt",
-            ),
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            "my-10k-bpe-tokenizer",
             unk_token="<unk>",
             pad_token="<pad>",
             bos_token="<s>",
             eos_token="</s>",
             mask_token="<mask>",
         )
-
+ 
         config = MoEConfig(
             vocab_size=10000,
             max_seq_len=1024,
