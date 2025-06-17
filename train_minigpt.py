@@ -1,4 +1,3 @@
-import tensorflow as tf
 import logging
 import numpy as np
 import os
@@ -8,6 +7,8 @@ import json
 import math
 from tokenizers import ByteLevelBPETokenizer
 from transformers import PreTrainedTokenizerFast
+import numpy as np
+import tensorflow as tf
 from tqdm import tqdm
 
 from minigpt_transformer import MoEMiniGPT, MoEConfig
@@ -101,63 +102,32 @@ if __name__ == "__main__":
             )
             return {'input_ids': np.array(tokens, dtype=np.int32)}
 
-        # Load and preprocess ConvAI2
-        logger.info("Loading ConvAI2...")
-        try:
-            convai2 = load_dataset("conv_ai_2", split="train[:1000]")
-            sample_convai2 = next(iter(convai2))
-            logger.info(f"Sample ConvAI2 example: {sample_convai2}")
-            convai2 = convai2.map(encode)
-            convai2_tf = tf.data.Dataset.from_generator(
-                lambda: ({"input_ids": ex["input_ids"]} for ex in list(convai2)),
-                output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
-            )
-        except Exception as e:
-            logger.warning(f"Could not load ConvAI2 dataset: {e}. Using synthetic data instead.")
-            synthetic_texts = [
-                "Hello, how are you today?",
-                "The quick brown fox jumps over the lazy dog.",
-                "Artificial intelligence is transforming the world.",
-                "Let's build a language model together!",
-                "What is your favorite programming language?",
-                "Deep learning enables powerful models.",
-                "This is a synthetic training example.",
-                "MoE models can scale efficiently.",
-                "Natural language processing is fascinating.",
-                "TensorFlow and PyTorch are popular frameworks."
-            ]
-            convai2_tf = make_synthetic_tf_dataset(synthetic_texts, tokenizer, config)
+       # Load and encode the corpus.txt lines
+        corpus_path = "corpus.txt"
+        with open(corpus_path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
 
-        # Load and preprocess DailyDialog
-        logger.info("Loading DailyDialog...")
-        try:
-            dailydialog = load_dataset("daily_dialog", split="train[:1000]")
-            sample_dailydialog = next(iter(dailydialog))
-            logger.info(f"Sample DailyDialog example: {sample_dailydialog}")
-            dailydialog = dailydialog.map(lambda ex: {"text": " ".join(ex["dialog"])})
-            dailydialog = dailydialog.map(encode)
-            dailydialog_tf = tf.data.Dataset.from_generator(
-                lambda: ({"input_ids": ex["input_ids"]} for ex in list(dailydialog)),
-                output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
+        def encode_line(line):
+            tokens = tokenizer.encode(
+                line,
+                max_length=config.seq_len,
+                truncation=True,
+                padding='max_length'
             )
-        except Exception as e:
-            logger.warning(f"Could not load DailyDialog dataset: {e}. Using synthetic data instead.")
-            synthetic_texts = [
-                "Hi! How can I help you?",
-                "Tell me a joke.",
-                "What is the weather like today?",
-                "Let's discuss machine learning.",
-                "Do you like open source software?",
-                "This is another synthetic example.",
-                "Language models are fun to train.",
-                "How do you use attention mechanisms?",
-                "Explain transformers in simple terms.",
-                "Goodbye and have a nice day!"
-            ]
-            dailydialog_tf = make_synthetic_tf_dataset(synthetic_texts, tokenizer, config)
+            return {"input_ids": np.array(tokens, dtype=np.int32)}
 
-        # Combine datasets and batch
-        train_dataset = convai2_tf.concatenate(dailydialog_tf).shuffle(2048).batch(config.batch_size)
+        encoded = [encode_line(line) for line in lines]
+
+        train_dataset = tf.data.Dataset.from_generator(
+            lambda: (ex for ex in encoded),
+            output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
+        ).shuffle(2048).batch(config.batch_size)
+
+        logger.info(f"Training dataset created with {len(encoded)} examples.")
+
+        # Count total number of tokens in the corpus
+        total_tokens = sum(len(tokenizer.encode(line)) for line in lines)
+        logger.info(f"Total number of tokens in corpus: {total_tokens}")
 
         # Metrics
         train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
@@ -203,14 +173,16 @@ if __name__ == "__main__":
             train_loss_metric.reset_state()
             train_accuracy_metric.reset_state()
             train_perplexity_metric.reset_state()
+            logger.info(f"Epoch {epoch+1}/{epochs} started.")
             progbar = tqdm(train_dataset, total=steps_per_epoch, desc=f"Epoch {epoch+1}/{epochs}", ncols=100)
-            for batch in progbar:
+            for step, batch in enumerate(progbar, 1):
                 global_step += 1
                 loss = train_step(batch)
                 loss_val = train_loss_metric.result().numpy()
                 acc_val = train_accuracy_metric.result().numpy()
                 perplexity_val = train_perplexity_metric.result().numpy()
                 progbar.set_postfix({
+                    "step": f"{step}/{steps_per_epoch}",
                     "loss": f"{loss_val:.4f}",
                     "acc": f"{acc_val:.4f}",
                     "ppl": f"{perplexity_val:.2f}"
@@ -239,6 +211,17 @@ if __name__ == "__main__":
             prompt = "Human: What is a mixture of experts model?"
             generated = model.generate_text(prompt, max_length=50)
             logger.info(f"Prompt: {prompt}\nGenerated: {generated}")
+
+        # Interactive chat loop
+        if hasattr(model, "generate_text"):
+            print("\n--- Chat with your model! Type 'quit' to exit. ---")
+            while True:
+                user_input = input("You: ")
+                if user_input.strip().lower() in ["quit", "exit"]:
+                    print("Exiting chat.")
+                    break
+                response = model.generate_text(user_input, max_length=50)
+                print("Model:", response)
 
     except Exception as e:
         logger.error(f"Error in main execution: {e}")

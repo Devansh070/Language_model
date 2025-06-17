@@ -27,7 +27,6 @@ var/
 # Logs and data
 *.log
 *.csv
-*.json
 
 # IDE
 .vscode/
