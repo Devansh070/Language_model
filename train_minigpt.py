@@ -165,7 +165,7 @@ if __name__ == "__main__":
         # Training loop with progress bar and metrics
         logger.info("Starting training...")
         epochs = 5
-        steps_per_epoch = tf.data.experimental.cardinality(train_dataset).numpy()
+        steps_per_epoch = math.ceil(len(encoded) / config.batch_size)
         logger.info(f"Epochs: {epochs}, Steps per epoch: {steps_per_epoch}")
 
         global_step = 0
