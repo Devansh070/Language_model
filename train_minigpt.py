@@ -1,36 +1,18 @@
 import logging
 import numpy as np
 import os
-from datasets import load_dataset
-import random
 import json
 import math
 from tokenizers import ByteLevelBPETokenizer
 from transformers import PreTrainedTokenizerFast
-import numpy as np
 import tensorflow as tf
 from tqdm import tqdm
 
 from minigpt_transformer import MoEMiniGPT, MoEConfig
 
-# Configure logging
+# Logging config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-def make_synthetic_tf_dataset(synthetic_texts, tokenizer, config, repeat=100):
-    def synthetic_gen():
-        for text in synthetic_texts * repeat:
-            tokens = tokenizer.encode(
-                text,
-                max_length=config.seq_len,
-                truncation=True,
-                padding='max_length'
-            )
-            yield {"input_ids": np.array(tokens, dtype=np.int32)}
-    return tf.data.Dataset.from_generator(
-        synthetic_gen,
-        output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
-    )
 
 if __name__ == "__main__":
     try:
@@ -70,6 +52,7 @@ if __name__ == "__main__":
         total_params = np.sum([np.prod(v.shape) for v in model.trainable_variables])
         logger.info(f"Total model parameters: {total_params:,}")
 
+        # Load corpus and tokenize
         corpus_path = "corpus.txt"
         with open(corpus_path, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip()]
@@ -123,7 +106,7 @@ if __name__ == "__main__":
             return loss
 
         logger.info("Starting training...")
-        epochs = 5
+        epochs = 2
         steps_per_epoch = math.ceil(len(encoded) / config.batch_size)
         logger.info(f"Epochs: {epochs}, Steps per epoch: {steps_per_epoch}")
 
@@ -131,22 +114,29 @@ if __name__ == "__main__":
         for epoch in range(epochs):
             train_loss_metric.reset_state()
             train_accuracy_metric.reset_state()
+            epoch_losses = []
+
             logger.info(f"Epoch {epoch+1}/{epochs} started.")
             progbar = tqdm(train_dataset, total=steps_per_epoch, desc=f"Epoch {epoch+1}/{epochs}", ncols=100)
             for step, batch in enumerate(progbar, 1):
                 global_step += 1
                 loss = train_step(batch)
+                epoch_losses.append(loss.numpy())
+
                 loss_val = train_loss_metric.result().numpy()
                 acc_val = train_accuracy_metric.result().numpy()
-                ppl_val = math.exp(loss_val)
+
                 progbar.set_postfix({
                     "step": f"{step}/{steps_per_epoch}",
                     "loss": f"{loss_val:.4f}",
-                    "acc": f"{acc_val:.4f}",
-                    "ppl": f"{ppl_val:.2f}"
+                    "acc": f"{acc_val:.4f}"
                 })
-            logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {loss_val:.4f} | Accuracy: {acc_val:.4f} | Perplexity: {ppl_val:.2f}")
 
+            avg_loss = np.mean(epoch_losses)
+            perplexity = math.exp(avg_loss)
+            logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} | Accuracy: {acc_val:.4f} | Perplexity: {perplexity:.2f}")
+
+        # Save model
         save_dir = "trained_models"
         os.makedirs(save_dir, exist_ok=True)
         weights_path = os.path.join(save_dir, "moe_minigpt.weights.h5")
@@ -159,6 +149,7 @@ if __name__ == "__main__":
             json.dump(config_dict, f, indent=2)
         logger.info(f"Configuration saved to {config_path}")
 
+        # Optional chat interface
         if hasattr(model, "generate_text"):
             print("\n--- Chat with your model! Type 'quit' to exit. ---")
             while True:
