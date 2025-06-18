@@ -26,22 +26,22 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MoEConfig:
     """Configuration for the MoE MiniGPT model."""
-    vocab_size: int = 50257
-    max_seq_len: int = 1024
-    embed_dim: int = 768
-    num_heads: int = 12
-    num_layers: int = 12
-    ffn_dim: int = 3072
+    vocab_size: int = 10000
+    max_seq_len: int = 256
+    embed_dim: int = 512
+    num_heads: int = 8
+    num_layers: int = 8
+    ffn_dim: int = 2048
     dropout: float = 0.1
     layer_norm_epsilon: float = 1e-5
     use_rotary_embeddings: bool = True
     learning_rate: float = 1e-4
-    batch_size: int = 1
-    seq_len: int = 1024
+    batch_size: int = 4
+    seq_len: int = 256
     
     # MoE specific parameters
-    num_experts: int = 8
-    top_k_experts: int = 2
+    num_experts: int = 4
+    top_k_experts: int = 1
     expert_capacity: Optional[int] = None  # Auto-calculated if None
     load_balancing_loss_weight: float = 0.01
     router_z_loss_weight: float = 0.001
@@ -59,7 +59,7 @@ class MoEConfig:
 class RotaryPositionalEmbedding(layers.Layer):
     """Rotary Positional Embedding layer with proper weight management."""
     
-    def __init__(self, dim=768, max_seq_len=1024, **kwargs):
+    def __init__(self, dim=512, max_seq_len=256, **kwargs):
         super().__init__(**kwargs)
         self.dim = dim
         self.max_seq_len = max_seq_len
@@ -121,7 +121,7 @@ class RotaryPositionalEmbedding(layers.Layer):
 class Expert(layers.Layer):
     """Individual expert network (FFN)."""
     
-    def __init__(self, embed_dim=768, ffn_dim=3072, dropout=0.1, expert_id=0, **kwargs):
+    def __init__(self, embed_dim=512, ffn_dim=2048, dropout=0.1, expert_id=0, **kwargs):
         super().__init__(**kwargs)
         self.embed_dim = embed_dim
         self.ffn_dim = ffn_dim
@@ -140,7 +140,7 @@ class Expert(layers.Layer):
 class Router(layers.Layer):
     """Router network for MoE that decides which experts to use."""
     
-    def __init__(self, embed_dim=768, num_experts=8, **kwargs):
+    def __init__(self, embed_dim=512, num_experts=4, **kwargs):
         super().__init__(**kwargs)
         self.embed_dim = embed_dim
         self.num_experts = num_experts
@@ -165,7 +165,7 @@ class Router(layers.Layer):
 class MixtureOfExperts(layers.Layer):
     """Mixture of Experts layer with efficient routing and load balancing."""
     
-    def __init__(self, embed_dim=768, ffn_dim=3072, num_experts=8, top_k=2, 
+    def __init__(self, embed_dim=512, ffn_dim=2048, num_experts=4, top_k=1, 
                  expert_capacity=None, dropout=0.1, load_balancing_loss_weight=0.01,
                  router_z_loss_weight=0.001, **kwargs):
         super().__init__(**kwargs)
@@ -275,7 +275,7 @@ class MixtureOfExperts(layers.Layer):
 class MultiHeadAttention(layers.Layer):
     """Multi-head attention layer with optional rotary embeddings"""
     
-    def __init__(self, embed_dim=768, num_heads=12, dropout=0.1, max_seq_len=1024, 
+    def __init__(self, embed_dim=512, num_heads=8, dropout=0.1, max_seq_len=256, 
                  use_rotary_embeddings=True, **kwargs):
         super().__init__(**kwargs)
         self.embed_dim = embed_dim
@@ -350,7 +350,7 @@ class MultiHeadAttention(layers.Layer):
 class FeedForward(layers.Layer):
     """Standard Feed-forward network (used in non-MoE layers)"""
     
-    def __init__(self, embed_dim=768, ffn_dim=3072, dropout=0.1, **kwargs):
+    def __init__(self, embed_dim=512, ffn_dim=2048, dropout=0.1, **kwargs):
         super().__init__(**kwargs)
         self.embed_dim = embed_dim
         self.ffn_dim = ffn_dim
@@ -368,9 +368,9 @@ class FeedForward(layers.Layer):
 class MoETransformerBlock(layers.Layer):
     """Transformer block with optional MoE FFN"""
     
-    def __init__(self, embed_dim=768, num_heads=12, ffn_dim=3072, dropout=0.1, 
-                 layer_norm_epsilon=1e-5, max_seq_len=1024, block_id=0, 
-                 use_moe=False, num_experts=8, top_k_experts=2, 
+    def __init__(self, embed_dim=512, num_heads=8, ffn_dim=2048, dropout=0.1, 
+                 layer_norm_epsilon=1e-5, max_seq_len=256, block_id=0, 
+                 use_moe=False, num_experts=4, top_k_experts=1, 
                  load_balancing_loss_weight=0.01, router_z_loss_weight=0.001, **kwargs):
         super().__init__(**kwargs)
         
@@ -762,16 +762,16 @@ def create_sample_model():
     """Create a sample MoE MiniGPT model for testing."""
     config = MoEConfig(
         vocab_size=10000,  # Set vocab size to 10000
-        max_seq_len=512,
-        embed_dim=384,
-        num_heads=6,
-        num_layers=6,
-        ffn_dim=1536,
+        max_seq_len=256,
+        embed_dim=512,
+        num_heads=8,
+        num_layers=8,
+        ffn_dim=2048,
         num_experts=4,
-        top_k_experts=2,
-        use_moe_layers=[2, 4],
-        batch_size=2,
-        seq_len=512
+        top_k_experts=1,
+        use_moe_layers=[2, 4, 6],
+        batch_size=4,
+        seq_len=256
     )
     model = MoEMiniGPT(config, tokenizer_path="my-10k-bpe-tokenizer")
     dummy_input = tf.ones((1, config.max_seq_len), dtype=tf.int32)

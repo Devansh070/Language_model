@@ -46,20 +46,20 @@ if __name__ == "__main__":
  
         config = MoEConfig(
             vocab_size=10000,
-            max_seq_len=1024,
-            embed_dim=768,
-            num_heads=12,
-            num_layers=12,
-            ffn_dim=3072,
+            max_seq_len=256,
+            seq_len=256,
+            embed_dim=512,
+            num_heads=8,
+            num_layers=8,
+            ffn_dim=2048,
             dropout=0.1,
             layer_norm_epsilon=1e-5,
             use_rotary_embeddings=True,
             learning_rate=1e-4,
-            batch_size=1,
-            seq_len=1024,
-            num_experts=8,
-            top_k_experts=2,
-            use_moe_layers=[2, 4, 6, 8, 10]
+            batch_size=4,
+            num_experts=4,
+            top_k_experts=1,
+            use_moe_layers=[2,4,6]
         )
 
         logger.info("Initializing MoEMiniGPT model...")
