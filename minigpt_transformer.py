@@ -36,7 +36,7 @@ class MoEConfig:
     layer_norm_epsilon: float = 1e-5
     use_rotary_embeddings: bool = True
     learning_rate: float = 1e-4
-    batch_size: int = 8
+    batch_size: int = 16
     seq_len: int = 256
     
     # MoE specific parameters
@@ -770,7 +770,7 @@ def create_sample_model():
         num_experts=4,
         top_k_experts=1,
         use_moe_layers=[2, 4, 6],
-        batch_size=8,
+        batch_size=16,
         seq_len=256
     )
     model = MoEMiniGPT(config, tokenizer_path="my-10k-bpe-tokenizer")
@@ -781,8 +781,8 @@ def create_sample_model():
     return model
 
 
-def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 512, 
-                        batch_size: int = 2, num_batches: int = 100):
+def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 256, 
+                        batch_size: int = 4, num_batches: int = 100):
     """Create a dummy dataset for testing."""
     def generator():
         for _ in range(num_batches):
