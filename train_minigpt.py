@@ -36,7 +36,7 @@ if __name__ == "__main__":
             dropout=0.1,
             layer_norm_epsilon=1e-5,
             use_rotary_embeddings=True,
-            learning_rate=1e-4,
+            learning_rate=1.5e-4,
             batch_size=32,
             num_experts=4,
             top_k_experts=1,
