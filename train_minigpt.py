@@ -37,7 +37,7 @@ if __name__ == "__main__":
             layer_norm_epsilon=1e-5,
             use_rotary_embeddings=True,
             learning_rate=1.5e-4,
-            batch_size=32,
+            batch_size=128,
             num_experts=4,
             top_k_experts=1,
             use_moe_layers=[2, 4, 6]
@@ -106,7 +106,7 @@ if __name__ == "__main__":
             return loss
 
         logger.info("Starting training...")
-        epochs = 2
+        epochs = 4
         steps_per_epoch = math.ceil(len(encoded) / config.batch_size)
         logger.info(f"Epochs: {epochs}, Steps per epoch: {steps_per_epoch}")
 

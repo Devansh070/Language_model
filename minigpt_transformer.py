@@ -36,7 +36,7 @@ class MoEConfig:
     layer_norm_epsilon: float = 1e-5
     use_rotary_embeddings: bool = True
     learning_rate: float = 1.5e-4
-    batch_size: int = 32
+    batch_size: int = 128
     seq_len: int = 256
     
     # MoE specific parameters
@@ -770,7 +770,7 @@ def create_sample_model():
         num_experts=4,
         top_k_experts=1,
         use_moe_layers=[2, 4, 6],
-        batch_size=32,
+        batch_size=128,
         seq_len=256
     )
     model = MoEMiniGPT(config, tokenizer_path="my-10k-bpe-tokenizer")
