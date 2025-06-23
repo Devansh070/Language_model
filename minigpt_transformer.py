@@ -35,7 +35,7 @@ class MoEConfig:
     dropout: float = 0.1
     layer_norm_epsilon: float = 1e-5
     use_rotary_embeddings: bool = True
-    learning_rate: float = 1.5e-4
+    learning_rate: float = 2e-4
     batch_size: int = 32
     seq_len: int = 256
     
