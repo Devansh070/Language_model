@@ -12,6 +12,7 @@ A lightweight implementation of a GPT-style language model using TensorFlow, fea
 - Number of transformer layers: 8
 - Feed-forward dimension: 768
 - Number of experts: 4
+- **Batch size: 48 (default)**
 
 ## Setup
 1. Install dependencies:
@@ -26,7 +27,7 @@ python train_minigpt.py
 
 ## Configuration
 Model and training parameters can be configured in `training_config.json`:
-- Batch size
+- Batch size (default: 48)
 - Learning rate
 - Number of epochs
 - Sequence length

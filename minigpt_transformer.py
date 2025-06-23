@@ -23,6 +23,9 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# NOTE: This model is compatible with mixed precision (fp16) training using tf.keras.mixed_precision.
+# Ensure no explicit float32 dtype is set in layers unless required for stability.
+
 @dataclass
 class MoEConfig:
     """Configuration for the MoE MiniGPT model."""
@@ -36,7 +39,7 @@ class MoEConfig:
     layer_norm_epsilon: float = 1e-5
     use_rotary_embeddings: bool = True
     learning_rate: float = 2e-4
-    batch_size: int = 32
+    batch_size: int = 48
     seq_len: int = 256
     
     # MoE specific parameters
@@ -770,7 +773,7 @@ def create_sample_model():
         num_experts=4,
         top_k_experts=1,
         use_moe_layers=[2, 4, 6],
-        batch_size=32,
+        batch_size=48,
         seq_len=256
     )
     model = MoEMiniGPT(config, tokenizer_path="my-10k-bpe-tokenizer")
@@ -782,8 +785,8 @@ def create_sample_model():
 
 
 def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 256, 
-                        batch_size: int = 4, num_batches: int = 100):
-    """Create a dummy dataset for testing."""
+                        batch_size: int = 48, num_batches: int = 100):
+    """Create a dummy dataset for testing, yielding (input_ids, labels) pairs."""
     def generator():
         for _ in range(num_batches):
             # Generate random token sequences
@@ -793,13 +796,17 @@ def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 256,
                 maxval=vocab_size, 
                 dtype=tf.int32
             )
-            yield batch
-    
+            # For language modeling, labels are input_ids shifted by one
+            input_ids = batch[:, :-1]
+            labels = batch[:, 1:]
+            yield input_ids, labels
     dataset = tf.data.Dataset.from_generator(
         generator,
-        output_signature=tf.TensorSpec(shape=(batch_size, seq_len), dtype=tf.int32)
+        output_signature=(
+            tf.TensorSpec(shape=(batch_size, seq_len-1), dtype=tf.int32),
+            tf.TensorSpec(shape=(batch_size, seq_len-1), dtype=tf.int32)
+        )
     )
-    
     return dataset
 
 

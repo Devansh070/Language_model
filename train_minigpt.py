@@ -7,12 +7,15 @@ from tokenizers import ByteLevelBPETokenizer
 from transformers import PreTrainedTokenizerFast
 import tensorflow as tf
 from tqdm import tqdm
+from tensorflow.keras import mixed_precision
 
 from minigpt_transformer import MoEMiniGPT, MoEConfig
 
 # Logging config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+mixed_precision.set_global_policy('mixed_float16')
 
 if __name__ == "__main__":
     try:
@@ -37,7 +40,7 @@ if __name__ == "__main__":
             layer_norm_epsilon=1e-5,
             use_rotary_embeddings=True,
             learning_rate=2e-4,
-            batch_size=32,
+            batch_size=48,
             num_experts=4,
             top_k_experts=1,
             use_moe_layers=[2, 4, 6]
