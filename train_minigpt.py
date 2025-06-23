@@ -9,7 +9,15 @@ import tensorflow as tf
 from tqdm import tqdm
 
 from minigpt_transformer import MoEMiniGPT, MoEConfig
-
+try:
+    resolver = tf.distribute.cluster_resolver.TPUClusterResolver()  # Detect TPU
+    tf.config.experimental_connect_to_cluster(resolver)
+    tf.tpu.experimental.initialize_tpu_system(resolver)
+    strategy = tf.distribute.TPUStrategy(resolver)
+    print("Running on TPU:", resolver.master())
+except ValueError:
+    strategy = tf.distribute.get_strategy()  # Default strategy for CPU/GPU
+    print("Running on CPU/GPU")
 # Logging config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)

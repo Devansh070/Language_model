@@ -10,6 +10,7 @@ import math
 import json
 from tokenizers import ByteLevelBPETokenizer
 from transformers import PreTrainedTokenizerFast
+import argparse
 
 # Optional: only import if transformers is available
 try:
@@ -570,72 +571,6 @@ class MoEMiniGPT(Model):
         logits = self.output_projection(x)
         return logits, total_aux_losses
 
-    def compute_loss_method(self, input_ids, labels=None):
-        """Fixed compute loss method that properly handles auxiliary losses."""
-        # Ensure input_ids is int32
-        input_ids = tf.cast(input_ids, tf.int32)
-        
-        # Ensure input_ids is properly shaped
-        if len(input_ids.shape) == 1:
-            input_ids = tf.expand_dims(input_ids, 0)
-        
-        # Handle the case where labels are None - create labels from input_ids
-        if labels is None:
-            # For language modeling, shift input_ids to create labels
-            input_for_model = input_ids[:, :-1]  # All tokens except last
-            labels = input_ids[:, 1:]            # All tokens except first (shifted)
-        else:
-            # Labels provided explicitly - ensure proper shape and dtype
-            labels = tf.cast(labels, tf.int32)
-            if len(labels.shape) == 1:
-                labels = tf.expand_dims(labels, 0)
-            input_for_model = input_ids
-        
-        # Validate that we have valid labels
-        if labels is None:
-            raise ValueError("Labels cannot be None after processing")
-        
-        # Get model predictions
-        logits, aux_losses = self(input_for_model, training=True)
-        
-        # Ensure shapes are compatible
-        batch_size = tf.shape(labels)[0]
-        seq_len = tf.shape(labels)[1]
-        vocab_size = tf.shape(logits)[-1]
-        
-        # Reshape for loss computation
-        labels_flat = tf.reshape(labels, [-1])  # [batch_size * seq_len]
-        logits_flat = tf.reshape(logits, [-1, vocab_size])  # [batch_size * seq_len, vocab_size]
-        
-        # Create mask to ignore invalid tokens (assuming -100 is used for padding/invalid tokens)
-        pad_token_id = -100
-        valid_mask = tf.not_equal(labels_flat, pad_token_id)
-        
-        # Compute sparse categorical crossentropy loss
-        losses = tf.keras.losses.sparse_categorical_crossentropy(
-            labels_flat, 
-            logits_flat, 
-            from_logits=True
-        )
-        
-        # Apply mask to ignore padded positions
-        num_valid = tf.reduce_sum(tf.cast(valid_mask, tf.float32))
-        if tf.greater(num_valid, 0):
-            # Only compute loss on valid tokens
-            masked_losses = tf.where(valid_mask, losses, 0.0)
-            main_loss = tf.reduce_sum(masked_losses) / tf.maximum(num_valid, 1.0)
-        else:
-            # If no valid mask, compute mean loss
-            main_loss = tf.reduce_mean(losses)
-        
-        # Add auxiliary losses from MoE layers
-        auxiliary_loss = 0.0
-        if aux_losses:
-            auxiliary_loss = tf.add_n([v for v in aux_losses.values()])
-        total_loss = main_loss + auxiliary_loss
-        
-        return total_loss
-
     def get_expert_utilization(self):
         """Get expert utilization statistics from MoE layers."""
         utilization_stats = {}
@@ -783,7 +718,7 @@ def create_sample_model():
 
 def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 256, 
                         batch_size: int = 4, num_batches: int = 100):
-    """Create a dummy dataset for testing."""
+    """Create a dummy dataset for testing, yielding (input_ids, labels) pairs."""
     def generator():
         for _ in range(num_batches):
             # Generate random token sequences
@@ -793,34 +728,69 @@ def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 256,
                 maxval=vocab_size, 
                 dtype=tf.int32
             )
-            yield batch
-    
+            # For language modeling, labels are input_ids shifted by one
+            input_ids = batch[:, :-1]
+            labels = batch[:, 1:]
+            yield input_ids, labels
     dataset = tf.data.Dataset.from_generator(
         generator,
-        output_signature=tf.TensorSpec(shape=(batch_size, seq_len), dtype=tf.int32)
+        output_signature=(
+            tf.TensorSpec(shape=(batch_size, seq_len-1), dtype=tf.int32),
+            tf.TensorSpec(shape=(batch_size, seq_len-1), dtype=tf.int32)
+        )
     )
-    
     return dataset
 
 
 if __name__ == "__main__":
-    # Example usage
-    model = create_sample_model()
+    parser = argparse.ArgumentParser(description="MiniGPT-MoE: TPU Training or Chat Mode")
+    parser.add_argument('--mode', choices=['train', 'chat'], default='chat', help='Mode: train or chat')
+    parser.add_argument('--epochs', type=int, default=3, help='Number of epochs for training')
+    args = parser.parse_args()
 
-    # Interactive chat loop
-    if model.tokenizer is not None and hasattr(model, "generate_text"):
-        print("MiniGPT Chat! Type 'quit' to exit.")
-        while True:
-            user_input = input("You: ")
-            if user_input.strip().lower() == "quit":
-                print("Exiting chat.")
-                break
-            response = model.generate_text(user_input, max_length=50)
-            print(f"MiniGPT: {response}")
+    # TPU/Strategy setup
+    try:
+        resolver = tf.distribute.cluster_resolver.TPUClusterResolver()
+        tf.config.experimental_connect_to_cluster(resolver)
+        tf.tpu.experimental.initialize_tpu_system(resolver)
+        strategy = tf.distribute.TPUStrategy(resolver)
+        print("Running on TPU:", resolver.master())
+    except ValueError:
+        strategy = tf.distribute.get_strategy()
+        print("Running on CPU/GPU")
+
+    if args.mode == 'train':
+        with strategy.scope():
+            model = create_sample_model()
+            optimizer = tf.keras.optimizers.Adam(learning_rate=model.config.learning_rate)
+            loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
+            model.compile(optimizer=optimizer, loss=loss_fn)
+            dataset = create_dummy_dataset(
+                vocab_size=model.config.vocab_size,
+                seq_len=model.config.max_seq_len,
+                batch_size=model.config.batch_size,
+                num_batches=100
+            )
+            dataset = dataset.cache().prefetch(tf.data.AUTOTUNE)
+            model.fit(dataset, epochs=args.epochs)
+            print(f"Model info: {model.get_model_info()}")
+            print(f"Expert utilization: {model.get_expert_utilization()}")
     else:
-        print("Tokenizer not available or generate_text not implemented. Model created successfully but text generation requires transformers library.")
-
-    # Display model information
-    print(f"Model info: {model.get_model_info()}")
-    print(f"Expert utilization: {model.get_expert_utilization()}")
+        # Example usage
+        model = create_sample_model()
+        # Interactive chat loop
+        if model.tokenizer is not None and hasattr(model, "generate_text"):
+            print("MiniGPT Chat! Type 'quit' to exit.")
+            while True:
+                user_input = input("You: ")
+                if user_input.strip().lower() == "quit":
+                    print("Exiting chat.")
+                    break
+                response = model.generate_text(user_input, max_length=50)
+                print(f"MiniGPT: {response}")
+        else:
+            print("Tokenizer not available or generate_text not implemented. Model created successfully but text generation requires transformers library.")
+        # Display model information
+        print(f"Model info: {model.get_model_info()}")
+        print(f"Expert utilization: {model.get_expert_utilization()}")
 
