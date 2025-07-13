@@ -14,16 +14,6 @@ A lightweight implementation of a GPT-style language model using TensorFlow, fea
 - Number of experts: 4
 - **Batch size: 48 (default)**
 
-## Setup
-1. Install dependencies:
-```bash
-pip install tensorflow numpy
-```
-
-2. Train the model:
-```bash
-python train_minigpt.py
-```
 
 ## Configuration
 Model and training parameters can be configured in `training_config.json`:
