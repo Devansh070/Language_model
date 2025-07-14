@@ -10,7 +10,7 @@ import math
 import json
 from tokenizers import ByteLevelBPETokenizer
 from transformers import PreTrainedTokenizerFast
-
+#Devansh Sinha 
 # Optional: only import if transformers is available
 try:
     from transformers import AutoTokenizer
@@ -19,14 +19,18 @@ except ImportError:
     print("Warning: transformers library not found. Tokenizer features will be disabled.")
     HAS_TRANSFORMERS = False
 
+#Devansh Sinha
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Devansh Sinha
 # NOTE: This model is compatible with mixed precision (fp16) training using tf.keras.mixed_precision.
 # Ensure no explicit float32 dtype is set in layers unless required for stability.
 
+#Devansh Sinha
 @dataclass
+#Devansh Sinha
 class MoEConfig:
     """Configuration for the MoE MiniGPT model."""
     vocab_size: int = 10000
@@ -41,7 +45,7 @@ class MoEConfig:
     learning_rate: float = 2e-4
     batch_size: int = 48
     seq_len: int = 256
-    
+    #Devansh Sinha
     # MoE specific parameters
     num_experts: int = 4
     top_k_experts: int = 1
@@ -49,35 +53,35 @@ class MoEConfig:
     load_balancing_loss_weight: float = 0.01
     router_z_loss_weight: float = 0.001
     use_moe_layers: List[int] = None  # Which layers to use MoE (None = all)
-    
+    #Devansh Sinha
     def __post_init__(self):
         if self.use_moe_layers is None:
             # Use MoE in every other layer starting from layer 2
             self.use_moe_layers = list(range(2, self.num_layers, 2))
-        
+    #Devansh Sinha
         if self.expert_capacity is None:
             # Auto-calculate expert capacity
             self.expert_capacity = max(4, (self.seq_len * self.batch_size * self.top_k_experts) // self.num_experts)
-
+#Devansh Sinha
 class RotaryPositionalEmbedding(layers.Layer):
     """Rotary Positional Embedding layer with proper weight management."""
-    
+    #Devansh Sinha
     def __init__(self, dim=512, max_seq_len=256, **kwargs):
         super().__init__(**kwargs)
         self.dim = dim
         self.max_seq_len = max_seq_len
-        
+      #Devansh Sinha  
     def build(self, input_shape):
         super().build(input_shape)
-        
+      #Devansh Sinha  
         # Create position indices - ensure int32 dtype
         position = tf.range(self.max_seq_len, dtype=tf.int32)
         position = tf.cast(position, tf.float32)
         div_term = tf.exp(tf.range(0, self.dim, 2, dtype=tf.float32) * -(tf.math.log(10000.0) / self.dim))
-        
+        #Devansh Sinha
         # Calculate sin and cos values
         pos = tf.expand_dims(position, 1) * tf.expand_dims(div_term, 0)
-        
+        #Devansh Sinha
         # Store as non-trainable weights
         self.sin_vals = self.add_weight(
             name='sin_vals',
@@ -91,11 +95,11 @@ class RotaryPositionalEmbedding(layers.Layer):
             initializer='zeros',
             trainable=False
         )
-        
+        #Devansh Sinha
         # Assign values
         self.sin_vals.assign(tf.sin(pos))
         self.cos_vals.assign(tf.cos(pos))
-    
+    #Devansh Sinha
     def _apply_rotary_pos_emb(self, x, sin, cos):
         """Apply rotary positional embeddings to input tensor."""
         seq_len = tf.shape(x)[2]
@@ -107,9 +111,9 @@ class RotaryPositionalEmbedding(layers.Layer):
         x1, x2 = tf.split(x, 2, axis=-1)
         rotated_x1 = cos * x1 - sin * x2
         rotated_x2 = sin * x1 + cos * x2
-        
+        #Devansh Sinha
         return tf.concat([rotated_x1, rotated_x2], axis=-1)
-    
+    #Devansh Sinha
     def call(self, x):
         return self._apply_rotary_pos_emb(x, self.sin_vals, self.cos_vals)
     
@@ -120,7 +124,7 @@ class RotaryPositionalEmbedding(layers.Layer):
             'max_seq_len': self.max_seq_len
         })
         return config
-
+#Devansh Sinha
 class Expert(layers.Layer):
     """Individual expert network (FFN)."""
     
@@ -139,7 +143,7 @@ class Expert(layers.Layer):
         x = self.dropout(x, training=training)
         x = self.dense2(x)
         return x
-
+#Devansh Sinha
 class Router(layers.Layer):
     """Router network for MoE that decides which experts to use."""
     
@@ -154,7 +158,7 @@ class Router(layers.Layer):
             kernel_initializer='truncated_normal',
             name='router_weights'
         )
-        
+        #Devansh Sinha
     def call(self, x):
         """
         Args:
@@ -164,7 +168,7 @@ class Router(layers.Layer):
         """
         router_logits = self.router_weights(x)
         return router_logits
-
+#Devansh Sinha
 class MixtureOfExperts(layers.Layer):
     """Mixture of Experts layer with efficient routing and load balancing."""
     
@@ -179,7 +183,7 @@ class MixtureOfExperts(layers.Layer):
         self.expert_capacity = expert_capacity or 32
         self.load_balancing_loss_weight = load_balancing_loss_weight
         self.router_z_loss_weight = router_z_loss_weight
-        
+        #Devansh Sinha
         # Router
         self.router = Router(embed_dim, num_experts, name='router')
         
@@ -188,7 +192,7 @@ class MixtureOfExperts(layers.Layer):
             Expert(embed_dim, ffn_dim, dropout, expert_id=i, name=f'expert_{i}')
             for i in range(num_experts)
         ]
-        
+        #Devansh Sinha
     def _compute_routing_probabilities(self, router_logits):
         """Compute routing probabilities and auxiliary losses."""
         # Apply softmax to get probabilities
@@ -207,7 +211,7 @@ class MixtureOfExperts(layers.Layer):
         # Load balancing loss - encourages equal utilization of experts
         # Average probability of routing to each expert
         expert_usage = tf.reduce_mean(router_probs, axis=[0, 1])  # [num_experts]
-        
+        #Devansh Sinha
         # Load balancing loss using squared coefficient of variation
         mean_usage = tf.reduce_mean(expert_usage)
         variance_usage = tf.reduce_mean(tf.square(expert_usage - mean_usage))
@@ -218,7 +222,7 @@ class MixtureOfExperts(layers.Layer):
         router_z_loss = tf.reduce_mean(tf.square(tf.reduce_logsumexp(router_logits, axis=-1)))
         
         return load_balancing_loss, router_z_loss
-    
+    #Devansh Sinha
     @tf.function
     def call(self, x, training=False):
         """
@@ -240,7 +244,7 @@ class MixtureOfExperts(layers.Layer):
         
         # Initialize output
         output = tf.zeros_like(x)
-        
+        #Devansh Sinha
         # Process each position with its top-k experts using tf.function compatible approach
         for k in range(self.top_k):
             # Get the k-th expert index and weight for each position
@@ -266,7 +270,7 @@ class MixtureOfExperts(layers.Layer):
                 has_tokens = tf.reduce_any(expert_mask)
                 expert_contribution = tf.cond(has_tokens, apply_expert, skip_expert)
                 output += expert_contribution
-        
+        #Devansh Sinha
         # Return output and auxiliary losses as a tuple
         aux_losses = {
             'load_balancing_loss': load_balancing_loss * self.load_balancing_loss_weight,
@@ -291,7 +295,7 @@ class MultiHeadAttention(layers.Layer):
         
         self.head_dim = embed_dim // num_heads
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        
+        #Devansh Sinha
         self.query_proj = layers.Dense(embed_dim, use_bias=False, name='query_proj')
         self.key_proj = layers.Dense(embed_dim, use_bias=False, name='key_proj')
         self.value_proj = layers.Dense(embed_dim, use_bias=False, name='value_proj')
@@ -327,7 +331,7 @@ class MultiHeadAttention(layers.Layer):
             k = self.rope(k)
         
         scores = tf.matmul(q, k, transpose_b=True) * self.scale
-        
+        #Devansh Sinha
         # Create causal mask - ensure int32 dtype
         causal_mask = tf.linalg.band_part(tf.ones((seq_len, seq_len), dtype=tf.float32), -1, 0)
         causal_mask = tf.where(tf.equal(causal_mask, 0), -1e9, 0.0)
@@ -357,7 +361,7 @@ class FeedForward(layers.Layer):
         super().__init__(**kwargs)
         self.embed_dim = embed_dim
         self.ffn_dim = ffn_dim
-        
+        #Devansh Sinha
         self.dense1 = layers.Dense(ffn_dim, activation='gelu', name='dense1')
         self.dense2 = layers.Dense(embed_dim, name='dense2')
         self.dropout = layers.Dropout(dropout)
@@ -388,7 +392,7 @@ class MoETransformerBlock(layers.Layer):
             use_rotary_embeddings=True,
             name=f'attention_{block_id}'
         )
-        
+        #Devansh Sinha
         # Feed-forward network (MoE or standard)
         if use_moe:
             self.ffn = MixtureOfExperts(
@@ -408,7 +412,7 @@ class MoETransformerBlock(layers.Layer):
                 dropout=dropout,
                 name=f'ffn_{block_id}'
             )
-        
+        #Devansh Sinha
         # Layer normalization
         self.ln1 = layers.LayerNormalization(epsilon=layer_norm_epsilon, name=f'ln1_{block_id}')
         self.ln2 = layers.LayerNormalization(epsilon=layer_norm_epsilon, name=f'ln2_{block_id}')
@@ -438,7 +442,7 @@ class MoETransformerBlock(layers.Layer):
             ffn_output = self.dropout2(ffn_output, training=training)
             x = x + ffn_output
             return x, {}
-
+#Devansh Sinha
 class MoEMiniGPT(Model):
     """MiniGPT model with Mixture of Experts."""
     
@@ -476,7 +480,7 @@ class MoEMiniGPT(Model):
             self.config.embed_dim,
             name="token_embedding"
         )
-        
+        #Devansh Sinha
         # Positional embedding layer (only if not using rotary)
         if not self.config.use_rotary_embeddings:
             self.pos_embedding = layers.Embedding(
@@ -511,7 +515,7 @@ class MoEMiniGPT(Model):
             epsilon=self.config.layer_norm_epsilon,
             name="final_layer_norm"
         )
-        
+        #Devansh Sinha
         # Output projection
         self.output_projection = layers.Dense(
             self.config.vocab_size,
@@ -525,7 +529,7 @@ class MoEMiniGPT(Model):
     @property
     def tokenizer(self):
         return self._tokenizer
-    
+    #Devansh Sinha
     def call(self, inputs, mask=None, training=False):
         """Fixed forward pass that properly handles auxiliary losses."""
         if isinstance(inputs, dict):
@@ -552,7 +556,7 @@ class MoEMiniGPT(Model):
         
         # Collect auxiliary losses
         total_aux_losses = {}
-        
+        #Devansh Sinha
         # Apply transformer blocks
         for block in self.transformer_blocks:
             if hasattr(block, 'use_moe') and block.use_moe:
@@ -581,7 +585,7 @@ class MoEMiniGPT(Model):
         # Ensure input_ids is properly shaped
         if len(input_ids.shape) == 1:
             input_ids = tf.expand_dims(input_ids, 0)
-        
+        #Devansh Sinha
         # Handle the case where labels are None - create labels from input_ids
         if labels is None:
             # For language modeling, shift input_ids to create labels
@@ -609,7 +613,7 @@ class MoEMiniGPT(Model):
         # Reshape for loss computation
         labels_flat = tf.reshape(labels, [-1])  # [batch_size * seq_len]
         logits_flat = tf.reshape(logits, [-1, vocab_size])  # [batch_size * seq_len, vocab_size]
-        
+        #Devansh Sinha
         # Create mask to ignore invalid tokens (assuming -100 is used for padding/invalid tokens)
         pad_token_id = -100
         valid_mask = tf.not_equal(labels_flat, pad_token_id)
@@ -620,7 +624,7 @@ class MoEMiniGPT(Model):
             logits_flat, 
             from_logits=True
         )
-        
+        #Devansh Sinha
         # Apply mask to ignore padded positions
         num_valid = tf.reduce_sum(tf.cast(valid_mask, tf.float32))
         if tf.greater(num_valid, 0):
@@ -656,7 +660,7 @@ class MoEMiniGPT(Model):
                 utilization_stats[layer_name] = {
                     'is_moe_layer': False
                 }
-        
+        #Devansh Sinha
         return utilization_stats
     
     def get_model_info(self):
@@ -669,7 +673,7 @@ class MoEMiniGPT(Model):
         
         moe_layers = [i for i in range(self.config.num_layers) if i in self.config.use_moe_layers]
         standard_layers = [i for i in range(self.config.num_layers) if i not in self.config.use_moe_layers]
-        
+        #Devansh Sinha
         info = {
             'model_type': 'MoE MiniGPT',
             'total_parameters': int(total_params),
@@ -713,12 +717,12 @@ class MoEMiniGPT(Model):
             'router_z_loss_weight': self.config.router_z_loss_weight,
             'use_moe_layers': self.config.use_moe_layers
         }
-        
+        #Devansh Sinha
         with open(filepath + '_config.json', 'w') as f:
             json.dump(config_dict, f, indent=2)
         
         logger.info(f"Model saved to {filepath}")
-    
+    #Devansh Sinha
     @classmethod
     def load_model(cls, filepath: str):
         """Load model from saved weights and configuration."""
@@ -782,7 +786,7 @@ def create_sample_model():
     logger.info("Sample MoE MiniGPT model created successfully!")
     logger.info(f"Model info: {model.get_model_info()}")
     return model
-
+#Devansh Sinha
 
 def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 256, 
                         batch_size: int = 48, num_batches: int = 100):
@@ -809,7 +813,7 @@ def create_dummy_dataset(vocab_size: int = 10000, seq_len: int = 256,
     )
     return dataset
 
-
+#Devansh Sinha
 if __name__ == "__main__":
     # Example usage
     model = create_sample_model()
