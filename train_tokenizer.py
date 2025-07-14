@@ -2,9 +2,9 @@
 from tokenizers import ByteLevelBPETokenizer
 from pathlib import Path
 import requests
-
+#Devansh Sinha
 texts = []
-
+#Devansh Sinha
 # Download multiple books from Project Gutenberg for a larger dataset
 urls = [
     "https://www.gutenberg.org/files/11/11-0.txt",     # Alice in Wonderland
@@ -18,7 +18,7 @@ urls = [
     "https://www.gutenberg.org/files/74/74-0.txt",     # The Adventures of Tom Sawyer
     "https://www.gutenberg.org/files/1400/1400-0.txt", # Great Expectations
 ]
-
+#Devansh Sinha
 for url in urls:
     print(f"Downloading {url} ...")
     response = requests.get(url)
@@ -28,9 +28,9 @@ for url in urls:
         print(f"Added {len(book_texts)} lines.")
     else:
         print(f"Failed to download {url}")
-
+#Devansh Sinha
 print(f"Total lines collected: {len(texts)}")
-
+#Devansh Sinha
 # Count total number of training tokens (words/wordpieces)
 total_tokens = sum(len(line.split()) for line in texts)
 print(f"Total number of training tokens (approximate, whitespace split): {total_tokens}")
@@ -40,7 +40,7 @@ corpus_path = "corpus.txt"
 with open(corpus_path, "w", encoding="utf-8") as f:
     for line in texts:
         f.write(line + "\n")
-
+#Devansh Sinha
 # Train a Byte Pair Encoding (BPE) tokenizer
 tokenizer = ByteLevelBPETokenizer()
 tokenizer.train(
@@ -49,12 +49,12 @@ tokenizer.train(
     min_frequency=2,
     special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"]
 )
-
+#Devansh Sinha
 # Save the tokenizer
 save_dir = "my-10k-bpe-tokenizer"
 Path(save_dir).mkdir(exist_ok=True)
 tokenizer.save_model(save_dir)
-
+#Devansh Sinha
 # Save as HuggingFace tokenizer JSON for compatibility
 tokenizer_json_path = str(Path(save_dir) / "tokenizer.json")
 tokenizer.save(tokenizer_json_path)
