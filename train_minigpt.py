@@ -8,15 +8,15 @@ from transformers import PreTrainedTokenizerFast
 import tensorflow as tf
 from tqdm import tqdm
 from tensorflow.keras import mixed_precision
-
+#Devansh Sinha
 from minigpt_transformer import MoEMiniGPT, MoEConfig
-
+#Devansh Sinha
 # Logging config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 mixed_precision.set_global_policy('mixed_float16')
-
+#Devansh Sinha
 if __name__ == "__main__":
     try:
         tokenizer = PreTrainedTokenizerFast(
@@ -27,7 +27,7 @@ if __name__ == "__main__":
             eos_token="</s>",
             mask_token="<mask>",
         )
-
+#Devansh Sinha
         config = MoEConfig(
             vocab_size=10000,
             max_seq_len=256,
@@ -45,7 +45,7 @@ if __name__ == "__main__":
             top_k_experts=1,
             use_moe_layers=[2, 4, 6]
         )
-
+#Devansh Sinha
         logger.info("Initializing MoEMiniGPT model...")
         model = MoEMiniGPT(config)
 
@@ -59,7 +59,7 @@ if __name__ == "__main__":
         corpus_path = "corpus.txt"
         with open(corpus_path, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f if line.strip()]
-
+#Devansh Sinha
         def encode_line(line):
             tokens = tokenizer.encode(
                 line,
@@ -70,7 +70,7 @@ if __name__ == "__main__":
             return {"input_ids": np.array(tokens, dtype=np.int32)}
 
         encoded = [encode_line(line) for line in lines]
-
+#Devansh Sinha
         train_dataset = tf.data.Dataset.from_generator(
             lambda: (ex for ex in encoded),
             output_signature={"input_ids": tf.TensorSpec(shape=(config.seq_len,), dtype=tf.int32)}
@@ -82,9 +82,9 @@ if __name__ == "__main__":
 
         train_loss_metric = tf.keras.metrics.Mean(name='train_loss')
         train_accuracy_metric = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
-
+#Devansh Sinha
         optimizer = tf.keras.optimizers.Adam(learning_rate=config.learning_rate)
-
+#Devansh Sinha
         @tf.function
         def train_step(batch):
             input_ids = batch['input_ids']
@@ -107,51 +107,51 @@ if __name__ == "__main__":
             train_loss_metric.update_state(loss)
             train_accuracy_metric.update_state(targets, logits, sample_weight=mask)
             return loss
-
+#Devansh Sinha
         logger.info("Starting training...")
         epochs = 2
         steps_per_epoch = math.ceil(len(encoded) / config.batch_size)
         logger.info(f"Epochs: {epochs}, Steps per epoch: {steps_per_epoch}")
-
+#Devansh Sinha
         global_step = 0
         for epoch in range(epochs):
             train_loss_metric.reset_state()
             train_accuracy_metric.reset_state()
             epoch_losses = []
-
+#Devansh Sinha
             logger.info(f"Epoch {epoch+1}/{epochs} started.")
             progbar = tqdm(train_dataset, total=steps_per_epoch, desc=f"Epoch {epoch+1}/{epochs}", ncols=100)
             for step, batch in enumerate(progbar, 1):
                 global_step += 1
                 loss = train_step(batch)
                 epoch_losses.append(loss.numpy())
-
+#Devansh Sinha
                 loss_val = train_loss_metric.result().numpy()
                 acc_val = train_accuracy_metric.result().numpy()
-
+#Devansh Sinha
                 progbar.set_postfix({
                     "step": f"{step}/{steps_per_epoch}",
                     "loss": f"{loss_val:.4f}",
                     "acc": f"{acc_val:.4f}"
                 })
-
+#Devansh Sinha
             avg_loss = np.mean(epoch_losses)
             perplexity = math.exp(avg_loss)
             logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f} | Accuracy: {acc_val:.4f} | Perplexity: {perplexity:.2f}")
-
+#Devansh Sinha
         # Save model
         save_dir = "trained_models"
         os.makedirs(save_dir, exist_ok=True)
         weights_path = os.path.join(save_dir, "moe_minigpt.weights.h5")
         model.save_weights(weights_path)
         logger.info(f"Model weights saved to {weights_path}")
-
+#Devansh Sinha
         config_path = os.path.join(save_dir, "moe_config.json")
         with open(config_path, 'w') as f:
             config_dict = {k: str(v) if isinstance(v, (list, type(None))) else v for k, v in vars(config).items()}
             json.dump(config_dict, f, indent=2)
         logger.info(f"Configuration saved to {config_path}")
-
+#Devansh Sinha
         # Optional chat interface
         if hasattr(model, "generate_text"):
             print("\n--- Chat with your model! Type 'quit' to exit. ---")
