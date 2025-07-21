@@ -40,7 +40,7 @@ if __name__ == "__main__":
             layer_norm_epsilon=1e-5,
             use_rotary_embeddings=True,
             learning_rate=2e-4,
-            batch_size=48,
+            batch_size=32,
             num_experts=4,
             top_k_experts=1,
             use_moe_layers=[2, 4, 6]
