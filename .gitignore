@@ -21,8 +21,6 @@ var/
 *.egg
 
 # Model files
-*.h5
-*.pkl
 
 # Logs and data
 *.log
