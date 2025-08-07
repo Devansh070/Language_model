@@ -7,7 +7,7 @@ from tokenizers import ByteLevelBPETokenizer
 from transformers import PreTrainedTokenizerFast
 import tensorflow as tf
 from tqdm import tqdm
-from tensorflow.keras import mixed_precision
+# from tensorflow.keras import mixed_precision
 #Devansh Sinha
 from minigpt_transformer import MoEMiniGPT, MoEConfig
 #Devansh Sinha
@@ -15,7 +15,7 @@ from minigpt_transformer import MoEMiniGPT, MoEConfig
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-mixed_precision.set_global_policy('mixed_float16')
+# mixed_precision.set_global_policy('mixed_float16')
 #Devansh Sinha
 if __name__ == "__main__":
     try:
@@ -109,7 +109,7 @@ if __name__ == "__main__":
             return loss
 #Devansh Sinha
         logger.info("Starting training...")
-        epochs = 2
+        epochs = 1
         steps_per_epoch = math.ceil(len(encoded) / config.batch_size)
         logger.info(f"Epochs: {epochs}, Steps per epoch: {steps_per_epoch}")
 #Devansh Sinha
